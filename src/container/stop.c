@@ -95,6 +95,11 @@ int stop_rootfs_locked(struct ds_config *caller_cfg, int skip_unmount,
 
   ds_log("Stopping container '%s' (PID %d)...", cfg->container_name, pid);
 
+  /* A detached enter session holds a pty and a shell in the container's
+   * cgroup. Ask its keeper to end before init is signalled, so the shell goes
+   * down with the container and the pts is released with it. */
+  ds_session_kill_container(cfg->container_name);
+
   /* The booted config names the image file, not where it is mounted. The mount
    * point is a function of the name, so look there. A directory container
    * does not claim a leftover image mount under its name: the firmware path

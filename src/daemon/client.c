@@ -40,82 +40,17 @@ static int send_request(int sock, int argc, char **argv, uint32_t flags) {
   return 0;
 }
 
-int ds_client_run(int argc, char **argv, const char *cmd, int want_stdin) {
-  if (argc < 1)
-    return -2;
-  if (!cmd)
-    cmd = "";
-
-  int is_enter = strcmp(cmd, "enter") == 0;
-  int is_boot = strcmp(cmd, "start") == 0 || strcmp(cmd, "restart") == 0;
-  int interactive = is_enter || is_boot || strcmp(cmd, "run") == 0;
+/* The terminal relay both the daemon client and session attach use. The
+ * socket already speaks the frame protocol: MSG_OUT/MSG_ERR to write, MSG_EXIT
+ * to finish, MSG_OUT from stdin to send. */
+int ds_terminal_relay(int socket, int interactive, int relay_stdin) {
+  int sock = socket;
   int has_tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
-
-  if (interactive && !has_tty) {
-    if (is_enter) {
-      ds_error("Interactive terminal is required for the enter command\n");
-      return 1;
-    }
-    /* Strip -f/--foreground; start_rootfs() will warn and flip the switch. */
-    if (is_boot) {
-      for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "-f") == 0 ||
-            strcmp(argv[i], "--foreground") == 0) {
-          for (int j = i; j < argc - 1; j++)
-            argv[j] = argv[j + 1];
-          argv[--argc] = NULL;
-          break;
-        }
-      }
-    }
-    interactive = 0;
-  }
-
-  /* --stdin on a pipe-mode run: relay our stdin to the command the way lxc
-   * exec does. Never by default, because libsu style callers share their
-   * stdin with the shell that is feeding them commands and we would eat the
-   * next line. A terminal session relays stdin anyway. */
-  int relay_stdin = want_stdin && !interactive && strcmp(cmd, "run") == 0;
-
-  /* try to connect - single pass for execution path, retry loop only for 1st
-   * connect */
-  int sock = -1;
-  struct sockaddr_un addr;
-  socklen_t alen = ds_abstract_addr(&addr, DS_SOCK_NAME);
-
-  int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (s < 0) {
-    fprintf(stderr, "client: socket: %s\n", strerror(errno));
-    return 1;
-  }
-  if (connect(s, (struct sockaddr *)&addr, alen) < 0) {
-    int err = errno;
-    close(s);
-    if (err == ECONNREFUSED || err == ENOENT)
-      return -2; /* Daemon not listening */
-    fprintf(stderr, "[-] Connection to daemon failed: %s\n", strerror(err));
-    return 1;
-  }
-  sock = s;
-
-  /* The daemon may reject us and close before we finish writing the request.
-   * Without this the kernel kills us with SIGPIPE: exit 141, no output. */
-  signal(SIGPIPE, SIG_IGN);
-
-  /* EPIPE means the daemon already closed. Its verdict (an error frame and
-   * the exit code) is queued on our socket, so fall through and relay it. */
-  mode_t mask = umask(0); /* musl has no getumask(), read it by swapping */
-  umask(mask);
-  uint32_t flags = (interactive ? REQ_FLAG_PTY : 0u) |
-                   (relay_stdin ? REQ_FLAG_STDIN : 0u) | REQ_FLAG_UMASK |
-                   ((uint32_t)(mask & 0777) << REQ_UMASK_SHIFT);
-  if (send_request(sock, argc, argv, flags) < 0 && errno != EPIPE)
-    goto send_err;
-
-  /* run the relay loop */
   struct termios orig;
   int raw_tty_active = 0;
   int winch_sfd = -1;
+
+  signal(SIGPIPE, SIG_IGN);
 
   if (interactive && has_tty && tcgetattr(STDIN_FILENO, &orig) == 0) {
     raw_tty_active = 1;
@@ -300,6 +235,81 @@ int ds_client_run(int argc, char **argv, const char *cmd, int want_stdin) {
   close(epfd);
   close(sock);
   return exit_code;
+}
+
+int ds_client_run(int argc, char **argv, const char *cmd, int want_stdin) {
+  if (argc < 1)
+    return -2;
+  if (!cmd)
+    cmd = "";
+
+  int is_enter = strcmp(cmd, "enter") == 0;
+  int is_boot = strcmp(cmd, "start") == 0 || strcmp(cmd, "restart") == 0;
+  int interactive = is_enter || is_boot || strcmp(cmd, "run") == 0;
+  int has_tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+
+  if (interactive && !has_tty) {
+    if (is_enter) {
+      ds_error("Interactive terminal is required for the enter command\n");
+      return 1;
+    }
+    /* Strip -f/--foreground; start_rootfs() will warn and flip the switch. */
+    if (is_boot) {
+      for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-f") == 0 ||
+            strcmp(argv[i], "--foreground") == 0) {
+          for (int j = i; j < argc - 1; j++)
+            argv[j] = argv[j + 1];
+          argv[--argc] = NULL;
+          break;
+        }
+      }
+    }
+    interactive = 0;
+  }
+
+  /* --stdin on a pipe-mode run: relay our stdin to the command the way lxc
+   * exec does. Never by default, because libsu style callers share their
+   * stdin with the shell that is feeding them commands and we would eat the
+   * next line. A terminal session relays stdin anyway. */
+  int relay_stdin = want_stdin && !interactive && strcmp(cmd, "run") == 0;
+
+  /* try to connect - single pass for execution path, retry loop only for 1st
+   * connect */
+  int sock = -1;
+  struct sockaddr_un addr;
+  socklen_t alen = ds_abstract_addr(&addr, DS_SOCK_NAME);
+
+  int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0) {
+    fprintf(stderr, "client: socket: %s\n", strerror(errno));
+    return 1;
+  }
+  if (connect(s, (struct sockaddr *)&addr, alen) < 0) {
+    int err = errno;
+    close(s);
+    if (err == ECONNREFUSED || err == ENOENT)
+      return -2; /* Daemon not listening */
+    fprintf(stderr, "[-] Connection to daemon failed: %s\n", strerror(err));
+    return 1;
+  }
+  sock = s;
+
+  /* The daemon may reject us and close before we finish writing the request.
+   * Without this the kernel kills us with SIGPIPE: exit 141, no output. */
+  signal(SIGPIPE, SIG_IGN);
+
+  /* EPIPE means the daemon already closed. Its verdict (an error frame and
+   * the exit code) is queued on our socket, so fall through and relay it. */
+  mode_t mask = umask(0); /* musl has no getumask(), read it by swapping */
+  umask(mask);
+  uint32_t flags = (interactive ? REQ_FLAG_PTY : 0u) |
+                   (relay_stdin ? REQ_FLAG_STDIN : 0u) | REQ_FLAG_UMASK |
+                   ((uint32_t)(mask & 0777) << REQ_UMASK_SHIFT);
+  if (send_request(sock, argc, argv, flags) < 0 && errno != EPIPE)
+    goto send_err;
+
+  return ds_terminal_relay(sock, interactive, relay_stdin);
 
 send_err:
   fprintf(stderr, "client: send failed: %s\n", strerror(errno));

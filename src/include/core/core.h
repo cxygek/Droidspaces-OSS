@@ -80,6 +80,7 @@ const char *get_workspace_dir(void);
 const char *get_pids_dir(void);
 const char *get_net_dir(void);
 const char *get_logs_dir(void);
+const char *get_sessions_dir(void);
 int ensure_workspace(void);
 
 /* platform.c */

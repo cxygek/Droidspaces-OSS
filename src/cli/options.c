@@ -168,6 +168,7 @@ const struct option long_options[] = {
     {"pids-limit", required_argument, 0, 268},
     {"init", required_argument, 0, 269},
     {"help", no_argument, 0, 'v'},
+    {"session-id", required_argument, 0, DS_OPT_SESSION_ID},
     {0, 0, 0, 0}};
 
 /* The command word in argv: the first argument that is neither an option nor
@@ -472,6 +473,9 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
         return -1;
       }
       safe_strncpy(cfg->custom_init, optarg, sizeof(cfg->custom_init));
+      break;
+    case DS_OPT_SESSION_ID:
+      /* Consumed by the enter command's own parser; nothing to persist. */
       break;
     default:
       break;

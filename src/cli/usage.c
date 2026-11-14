@@ -31,6 +31,9 @@ void print_usage(void) {
          "  stop                      Stop one or more containers\n"
          "  restart                   Restart a container\n"
          "  enter [user]              Enter a running container\n"
+         "  session list              List running terminal sessions\n"
+         "  session attach <id>       Reattach to a running terminal session\n"
+         "  session kill <id>         End a terminal session\n"
          "  run [--] <cmd> [args]     Run a command in a running container\n"
          "  info                      Show detailed container info\n"
          "  pid                       Show the live PID of the container init\n"
@@ -138,5 +141,7 @@ void print_usage(void) {
          "Examples:" C_RESET "\n"
          "  droidspaces --name=mycontainer --rootfs=/path/to/rootfs start\n"
          "  droidspaces --name=mycontainer enter\n"
+         "  droidspaces --name=mycontainer session list\n"
+         "  droidspaces session attach 0123456789abcdef0123456789abcdef\n"
          "  droidspaces --name=mycontainer stop\n\n");
 }

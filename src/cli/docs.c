@@ -167,6 +167,8 @@ static void print_page(int page, const char *bin) {
     p_printf("%sEntering the container:%s\n", bold, reset);
     p_printf("  %s --name=mycontainer enter\n", bin);
     p_printf("  %s --name=mycontainer enter username\n\n", bin);
+    p_printf("  The shell keeps running when the client goes away. Reattach\n");
+    p_printf("  with 'session list' and 'session attach <id>'.\n\n");
 
     p_printf("%sRunning Commands:%s\n", bold, reset);
     p_printf("  %s --name=mycontainer run 'uname -a'\n", bin);
@@ -195,6 +197,15 @@ static void print_page(int page, const char *bin) {
     p_printf("%sListing Containers:%s\n", bold, reset);
     p_printf("  %s show\n", bin);
     p_printf("  (Displays name and PID inside a table)\n\n");
+
+    p_printf("%sTerminal Sessions:%s\n", bold, reset);
+    p_printf("  %s --name=mycontainer session list\n", bin);
+    p_printf("  %s --name=mycontainer --json session list\n", bin);
+    p_printf("  %s session attach <id>\n", bin);
+    p_printf("  %s session kill <id>\n", bin);
+    p_printf("  (An enter shell is owned by a daemon keeper, not by the\n");
+    p_printf("   client that opened it. Closing the app leaves it running,\n");
+    p_printf("   and session attach brings the same terminal back.)\n\n");
 
     p_printf("%sListing Containers (JSON):%s\n", bold, reset);
     p_printf("  %s --json show\n", bin);

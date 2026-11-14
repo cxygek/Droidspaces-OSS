@@ -102,6 +102,7 @@
 #define DS_VOLATILE_SUBDIR "Volatile"
 #define DS_LOGS_SUBDIR "Logs"
 #define DS_NET_SUBDIR "Net"
+#define DS_SESSIONS_SUBDIR "Sessions"
 #define DS_ANDROID_TMPFS_CONTEXT "u:object_r:tmpfs:s0"
 #define DS_ANDROID_VOLD_CONTEXT "u:object_r:vold_data_file:s0"
 

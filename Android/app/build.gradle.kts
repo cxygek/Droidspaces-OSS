@@ -148,9 +148,17 @@ tasks.register<Copy>("generateBootModule") {
 
 // The backend the APK ships. make is incremental, so an unchanged src/ costs one no-op per arch
 val phoneArches = listOf("aarch64", "armhf", "x86_64", "x86")
+val isWindowsHost = System.getProperty("os.name").orEmpty().contains("windows", ignoreCase = true)
 val buildBackend = tasks.register<Exec>("buildBackend") {
     workingDir(repo)
-    commandLine(listOf("make") + phoneArches)
+    if (isWindowsHost) {
+        // Windows has no make or musl toolchain. Run the same make in the
+        // default WSL distro; WSL translates this working directory to
+        // /mnt/<drive>/..., and the output binaries land back in the repo.
+        commandLine(listOf("wsl.exe", "make") + phoneArches)
+    } else {
+        commandLine(listOf("make") + phoneArches)
+    }
     inputs.dir(repo.dir("src"))
     inputs.file(repo.file("Makefile"))
     outputs.files(phoneArches.map { repo.file("output/droidspaces-$it") })

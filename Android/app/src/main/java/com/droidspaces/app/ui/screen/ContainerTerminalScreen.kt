@@ -38,6 +38,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.droidspaces.app.ui.component.DsDialog
 import com.droidspaces.app.service.TerminalSessionService
 import com.droidspaces.app.ui.component.DialogFooterRow
+import com.droidspaces.app.ui.terminal.NoOpTerminalSessionClient
 import com.droidspaces.app.ui.terminal.TerminalBackEnd
 import com.droidspaces.app.ui.terminal.TerminalScreenState
 import com.droidspaces.app.ui.terminal.virtualkeys.VirtualKeysConstants
@@ -50,6 +51,7 @@ import com.droidspaces.app.util.ContainerOSInfoManager
 import com.droidspaces.app.util.ContainerUsersManager
 import com.droidspaces.app.util.FontInfo
 import com.droidspaces.app.util.PreferencesManager
+import com.droidspaces.app.util.TerminalSessionManager
 import java.io.File
 import com.droidspaces.app.ui.util.FullScreenLoading
 import com.droidspaces.app.ui.util.LoadingSize
@@ -72,6 +74,12 @@ private data class TerminalTab(
     val id: String,
     val user: String,
     val label: String,
+    // The keeper session behind this tab. A new enter shell names it with
+    // --session-id; a reattached tab uses the id found by `session list`.
+    val backendSessionId: String? = null,
+    // True only for the second kind, so the view attaches instead of opening a
+    // second shell when it has to create the session itself.
+    val attached: Boolean = false,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -159,8 +167,15 @@ fun ContainerTerminalScreen(
 
     fun addTab(user: String) {
         TerminalSessionService.start(context)
-        val id = "${containerName}_${UUID.randomUUID().toString().take(8)}"
-        val newTab = TerminalTab(id = id, user = user, label = "$user@$hostname")
+        // Same shape as a backend session id, so this tab's close can name the
+        // keeper session it is about to create.
+        val id = UUID.randomUUID().toString().replace("-", "")
+        val newTab = TerminalTab(
+            id = id,
+            user = user,
+            label = "$user@$hostname",
+            backendSessionId = id,
+        )
         val currentIndex = tabs.indexOfFirst { it.id == activeTabId }
         if (currentIndex != -1) {
             tabs.add(currentIndex + 1, newTab)
@@ -175,10 +190,14 @@ fun ContainerTerminalScreen(
     // The fetch belongs to the screen, not the effect. A restarted LaunchedEffect cancels
     // its coroutine, but Shell.exec runs to the end first, so the restart would find the
     // fetch still busy and skip, and the cancelled one never opened anything.
-    fun pickUserOrOpenRoot() {
+    fun pickUserOrOpenRoot(onlyIfEmpty: Boolean = false) {
         if (pickJob?.isActive == true) return
         pickJob = scope.launch {
             val users = ContainerUsersManager.getUsers(containerName, useCache = false)
+            // The initial restore call must not open a picker after backend tabs
+            // landed. The + button is an explicit request for another tab, so it
+            // passes false and works with tabs already open.
+            if (onlyIfEmpty && tabs.isNotEmpty()) return@launch
             availableUsers = listOf("root") + users
             if (users.isEmpty()) {
                 addTab("root")
@@ -198,16 +217,75 @@ fun ContainerTerminalScreen(
     LaunchedEffect(binder, hostnameReady) {
         binder ?: return@LaunchedEffect
         if (!hostnameReady) return@LaunchedEffect
-        if (tabs.isNotEmpty()) return@LaunchedEffect
+
+        // Tabs this process already owns. A session created by one of them now
+        // carries that tab's id, so the backend list below can be compared by
+        // id without opening a second shell.
         val existing = TerminalSessionService.globalSessionList
             .filter { (_, info) -> info.containerName == containerName }
-        if (existing.isNotEmpty()) {
-            existing.forEach { (id, info) ->
-                tabs.add(TerminalTab(id = id, user = info.user, label = "${info.user}@$hostname"))
+        existing.forEach { (id, info) ->
+            if (tabs.none { it.id == id }) {
+                tabs.add(
+                    TerminalTab(
+                        id = id,
+                        user = info.user,
+                        label = "${info.user}@$hostname",
+                        backendSessionId = info.backendSessionId,
+                        attached = info.attached,
+                    )
+                )
             }
-            activeTabId = existing.keys.last()
-        } else {
-            pickUserOrOpenRoot()
+        }
+        if (existing.isNotEmpty() && activeTabId.isEmpty()) activeTabId = existing.keys.last()
+
+        // Sessions the keeper still owns whose id no in-process tab claims.
+        // That is the app-restart case, and it also picks up a shell whose tab
+        // was closed while a foreground program kept it alive.
+        val restored = TerminalSessionManager.listSessions(containerName)
+        val knownIds = TerminalSessionService.globalSessionList.keys
+        val missing = restored.filter { session ->
+            session.id !in knownIds && tabs.none { it.id == session.id }
+        }
+        if (missing.isNotEmpty()) {
+            // The service connection can come and go while the list command
+            // runs; without one there is nothing to attach through.
+            val service = binder ?: return@LaunchedEffect
+            if (existing.isEmpty()) {
+                // A user picker may have been queued before the fetch finished.
+                pickJob?.cancel()
+                pickJob = null
+                showUserPicker = false
+            }
+            TerminalSessionService.start(context)
+            missing.forEach { session ->
+                // A cancelled effect can still finish its list command; do not
+                // add a second tab for a session the new run already restored.
+                if (tabs.any { it.id == session.id }) return@forEach
+                // Only the active tab's AndroidView is composed, so create the
+                // attach session for every restored tab here. The view takes it
+                // over with getSession() when its tab becomes visible.
+                service.createAttachedSession(
+                    containerName = containerName,
+                    client = NoOpTerminalSessionClient,
+                    sessionId = session.id,
+                    containerUser = session.user,
+                )
+                tabs.add(
+                    TerminalTab(
+                        id = session.id,
+                        user = session.user,
+                        label = "${session.user}@$hostname",
+                        backendSessionId = session.id,
+                        attached = true,
+                    )
+                )
+            }
+        }
+
+        if (tabs.isEmpty()) {
+            pickUserOrOpenRoot(onlyIfEmpty = true)
+        } else if (activeTabId.isEmpty()) {
+            activeTabId = tabs.last().id
         }
     }
 
@@ -474,13 +552,23 @@ private fun TerminalTabView(
                                         }
                                     },
                                 )
+                                val backendSessionId = tab.backendSessionId ?: tab.id
                                 val session: TerminalSession =
-                                    binder.getSession(tab.id) ?: binder.createSession(
-                                        containerName = containerName,
-                                        client = client,
-                                        containerUser = tab.user,
-                                        sessionId = tab.id,
-                                    )
+                                    binder.getSession(tab.id) ?: if (tab.attached) {
+                                        binder.createAttachedSession(
+                                            containerName = containerName,
+                                            client = client,
+                                            sessionId = backendSessionId,
+                                            containerUser = tab.user,
+                                        )
+                                    } else {
+                                        binder.createSession(
+                                            containerName = containerName,
+                                            client = client,
+                                            containerUser = tab.user,
+                                            sessionId = tab.id,
+                                        )
+                                    }
                                 session.updateTerminalSessionClient(client)
                                 attachSession(session)
                                 setTerminalViewClient(client)

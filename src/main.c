@@ -298,7 +298,12 @@ int main(int argc, char **argv) {
                           strcmp(discovered_cmd, "mode") == 0 ||
                           strcmp(discovered_cmd, "check") == 0));
 
-  if (!is_daemon_cmd && !is_no_root_cmd && getenv("DS_NO_PROXY") == NULL) {
+  /* Session commands talk to a keeper directly and need this process's own
+   * terminal, so proxying them through the daemon would lose both. */
+  int is_local_cmd = (discovered_cmd && strcmp(discovered_cmd, "session") == 0);
+
+  if (!is_daemon_cmd && !is_no_root_cmd && !is_local_cmd &&
+      getenv("DS_NO_PROXY") == NULL) {
     int proxy_ret =
         ds_client_run(argc - 1, argv + 1, discovered_cmd, run_stdin);
     if (proxy_ret != -2) {
@@ -454,6 +459,40 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "scan") == 0) {
     scan_containers();
     ret = 0;
+    goto cleanup;
+  }
+
+  if (strcmp(cmd, "session") == 0) {
+    const char *action = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+    if (!action) {
+      ds_error("Missing session action.");
+      ds_log("Use '" C_BOLD "%s session list" C_RESET "', "
+             "'" C_BOLD "session attach <id>" C_RESET "' or "
+             "'" C_BOLD "session kill <id>" C_RESET "'.",
+             cfg.prog_name);
+      ret = 1;
+    } else if (strcmp(action, "list") == 0) {
+      ret = ds_session_list(&cfg);
+    } else if (strcmp(action, "attach") == 0) {
+      const char *id = (optind + 2 < argc) ? argv[optind + 2] : NULL;
+      if (!id) {
+        ds_error("session attach requires a session id.");
+        ret = 1;
+      } else {
+        ret = ds_session_attach(id);
+      }
+    } else if (strcmp(action, "kill") == 0) {
+      const char *id = (optind + 2 < argc) ? argv[optind + 2] : NULL;
+      if (!id) {
+        ds_error("session kill requires a session id.");
+        ret = 1;
+      } else {
+        ret = ds_session_kill(id);
+      }
+    } else {
+      ds_error("Unknown session action: '%s'", action);
+      ret = 1;
+    }
     goto cleanup;
   }
 

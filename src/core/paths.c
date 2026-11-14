@@ -34,11 +34,21 @@ const char *get_logs_dir(void) {
   return logs_path;
 }
 
+const char *get_sessions_dir(void) {
+  static char sessions_path[PATH_MAX];
+  snprintf(sessions_path, sizeof(sessions_path), "%s/%s", get_workspace_dir(),
+           DS_SESSIONS_SUBDIR);
+  return sessions_path;
+}
+
 int ensure_workspace(void) {
   mkdir_p(get_workspace_dir(), 0755);
   mkdir_p(get_pids_dir(), 0755);
   mkdir_p(get_net_dir(), 0755);
   mkdir_p(get_logs_dir(), 0755);
+  /* Root only: a session record names the container and the user of a live
+   * root shell. */
+  mkdir_p(get_sessions_dir(), 0700);
 
   return 0;
 }

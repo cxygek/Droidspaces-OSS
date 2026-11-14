@@ -10,6 +10,11 @@ import java.io.File
 object ModuleInstaller {
     private const val MODULE_PATH = "/data/adb/modules/droidspaces"
 
+    // These are executed or parsed by Android/Linux, not by Gradle. A Windows
+    // checkout can hand us CRLF, which makes a shell assignment end in a CR:
+    // that is how a boot script used to create "/data/local/Droidspaces<CR>".
+    private val TEXT_ASSET_EXTENSIONS = setOf("sh", "prop", "rule")
+
     /** The boot-module assets, staged in cacheDir, installed over a fresh module directory. */
     suspend fun install(context: Context): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
@@ -37,7 +42,19 @@ object ModuleInstaller {
     private fun copyAssetDir(assets: AssetManager, path: String, dest: File) {
         val children = assets.list(path).orEmpty()
         if (children.isEmpty()) {
-            assets.open(path).use { input -> dest.outputStream().use { input.copyTo(it) } }
+            assets.open(path).use { input ->
+                val bytes = input.readBytes()
+                val extension = path.substringAfterLast('.', "")
+                if (extension in TEXT_ASSET_EXTENSIONS) {
+                    dest.writeText(
+                        String(bytes, Charsets.UTF_8)
+                            .replace("\r\n", "\n")
+                            .replace('\r', '\n')
+                    )
+                } else {
+                    dest.writeBytes(bytes)
+                }
+            }
             return
         }
         dest.mkdirs()

@@ -97,6 +97,36 @@ static int exit_status(int st) {
  * 126 when it is there but cannot be run. Read errno before logging. */
 static int exec_exit_code(void) { return errno == ENOENT ? 127 : 126; }
 
+/* 0 when the child was reaped within timeout_ms, -1 when it still runs. */
+static int reap_child_timeout(pid_t pid, int timeout_ms, int *status) {
+  int waited = 0;
+  for (;;) {
+    pid_t r = waitpid(pid, status, WNOHANG);
+    if (r == pid)
+      return 0;
+    if (r < 0 && errno != EINTR)
+      return -1;
+    if (waited >= timeout_ms)
+      return -1;
+    usleep(20000);
+    waited += 20;
+  }
+}
+
+/* The intermediate is the session leader because login's vhangup() must not
+ * reach the shell. That also means a shell which ignores the pty hangup can
+ * outlive its client, so an explicit end has to take the session down. */
+static volatile pid_t g_session_shell_pid = 0;
+
+static void session_leader_term(int sig) {
+  (void)sig;
+  pid_t shell = g_session_shell_pid;
+  if (shell > 0)
+    kill(shell, SIGKILL);
+  kill(-getpid(), SIGKILL);
+  _exit(1);
+}
+
 int enter_rootfs(struct ds_config *cfg, const char *user) {
   pid_t pid = 0;
   if (!is_container_running(cfg, &pid) || pid <= 0) {
@@ -181,6 +211,14 @@ int enter_rootfs(struct ds_config *cfg, const char *user) {
     if (ioctl(tty.slave, TIOCSCTTY, 0) < 0)
       _exit(EXIT_FAILURE);
     signal(SIGHUP, SIG_IGN);
+    /* The daemon keeper may outlive the app, but not the session. When the
+     * keeper closes the host pty the top process ends us with SIGTERM, and
+     * this takes the shell and its jobs with it instead of leaving the pts
+     * behind. PDEATHSIG covers the keeper having to SIGKILL that process. */
+    signal(SIGTERM, session_leader_term);
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() == 1)
+      raise(SIGTERM);
 
     close(sv[1]);
 
@@ -188,6 +226,7 @@ int enter_rootfs(struct ds_config *cfg, const char *user) {
     pid_t shell_pid = fork();
     if (shell_pid < 0)
       _exit(EXIT_FAILURE);
+    g_session_shell_pid = shell_pid;
     if (shell_pid == 0) {
       /* Only the guest shell loses the protection. The session leader above
        * holds the tty, and an OOM kill of it would end the session. */
@@ -272,9 +311,20 @@ int enter_rootfs(struct ds_config *cfg, const char *user) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_tios);
   }
 
+  /* Closing the host pty is what ends the session: the proxy above already
+   * returned on that hangup, and the intermediate gets a moment to reap its
+   * shell on its own. A shell that ignores the hangup would otherwise keep
+   * the pts and a cgroup reference after the app is gone. */
   close(master_fd);
   int st;
-  waitpid(child, &st, 0);
+  if (reap_child_timeout(child, 200, &st) < 0) {
+    kill(child, SIGTERM);
+    if (reap_child_timeout(child, 2000, &st) < 0) {
+      kill(child, SIGKILL);
+      if (waitpid(child, &st, 0) < 0)
+        st = 0;
+    }
+  }
   free_config_env_vars(cfg);
   return exit_status(st);
 }

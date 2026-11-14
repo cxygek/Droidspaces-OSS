@@ -18,11 +18,25 @@ import com.droidspaces.app.MainActivity
 import com.droidspaces.app.R
 import com.droidspaces.app.ui.terminal.DroidspacesTerminalSession
 import com.droidspaces.app.util.PreferencesManager
+import com.droidspaces.app.util.TerminalSessionManager
 import com.droidspaces.app.ui.terminal.NoOpTerminalSessionClient
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 
-data class SessionInfo(val containerName: String, val user: String, val fontSizePx: Int)
+/**
+ * [backendSessionId] is the keeper session behind this tab, for a new enter
+ * shell and for a tab attached to one the app found again. It is what lets
+ * closing the tab end exactly that backend shell. [attached] says whether the
+ * tab was created by attaching to an existing session, so a screen rebuilt from
+ * the service knows not to open a second shell.
+ */
+data class SessionInfo(
+    val containerName: String,
+    val user: String,
+    val fontSizePx: Int,
+    val backendSessionId: String? = null,
+    val attached: Boolean = false,
+)
 
 class TerminalSessionService : Service() {
 
@@ -36,25 +50,65 @@ class TerminalSessionService : Service() {
             containerName: String,
             client: TerminalSessionClient,
             containerUser: String? = null,
-            sessionId: String = containerName,
+            sessionId: String,
         ): TerminalSession {
             val user = containerUser ?: "root"
             return DroidspacesTerminalSession.create(
                 sessionClient = client,
                 containerName = containerName,
                 containerUser = user,
+                sessionId = sessionId,
             ).also {
-                sessions[sessionId] = it
-                globalSessionList[sessionId] = SessionInfo(
+                registerSession(
+                    sessionId,
+                    it,
                     containerName,
                     user,
-                    PreferencesManager.getInstance(this@TerminalSessionService).terminalFontSizePx
+                    backendSessionId = sessionId,
+                    attached = false,
                 )
-                if (sessions.size == 1) {
-                    promoteToForeground()
-                } else {
-                    updateNotification()
+            }
+        }
+
+        /**
+         * Attach a tab to a session the backend keeper kept alive. The service
+         * stores it under the backend id, so re-entering the screen rehydrates
+         * the same tab and closing it can end the backend shell.
+         */
+        fun createAttachedSession(
+            containerName: String,
+            client: TerminalSessionClient,
+            sessionId: String,
+            containerUser: String,
+        ): TerminalSession {
+            val user = containerUser.ifBlank { "root" }
+            sessions[sessionId]?.let { existing ->
+                // Re-register if a previous screen removed the registry entry
+                // but the 300 ms teardown has not dropped the session yet.
+                if (globalSessionList[sessionId] == null) {
+                    registerSession(
+                        sessionId,
+                        existing,
+                        containerName,
+                        user,
+                        backendSessionId = sessionId,
+                        attached = true,
+                    )
                 }
+                return existing
+            }
+            return DroidspacesTerminalSession.createAttach(
+                sessionClient = client,
+                sessionId = sessionId,
+            ).also {
+                registerSession(
+                    sessionId,
+                    it,
+                    containerName,
+                    user,
+                    backendSessionId = sessionId,
+                    attached = true,
+                )
             }
         }
 
@@ -142,6 +196,29 @@ class TerminalSessionService : Service() {
         }
     }
 
+    private fun registerSession(
+        sessionId: String,
+        session: TerminalSession,
+        containerName: String,
+        user: String,
+        backendSessionId: String?,
+        attached: Boolean,
+    ) {
+        sessions[sessionId] = session
+        globalSessionList[sessionId] = SessionInfo(
+            containerName,
+            user,
+            PreferencesManager.getInstance(this).terminalFontSizePx,
+            backendSessionId,
+            attached,
+        )
+        if (sessions.size == 1) {
+            promoteToForeground()
+        } else {
+            updateNotification()
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_EXIT -> binder.terminateAllSessions()
@@ -165,8 +242,14 @@ class TerminalSessionService : Service() {
      * could no longer reach them.
      */
     private fun terminate(ids: Collection<String>) {
+        // Every tab now owns a keeper session in the backend, not only the
+        // local pty. Its Ctrl-D may reach a foreground program that ignores it,
+        // so end the keeper session explicitly; closeTab, notification Exit and
+        // container stop all come through here.
+        val backendIds = ids.mapNotNull { globalSessionList[it]?.backendSessionId }
         val targets = ids.mapNotNull { id -> sessions[id]?.also { globalSessionList.remove(id) } }
         targets.forEach { runCatching { it.write("\u0004") } }
+        backendIds.forEach { TerminalSessionManager.killSessionAsync(it) }
         updateNotification()
         Handler(Looper.getMainLooper()).postDelayed({
             targets.forEach { runCatching { if (it.emulator != null) it.finishIfRunning() } }

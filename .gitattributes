@@ -1,0 +1,5 @@
+# Text files are stored and checked out as LF everywhere. Android and Linux run
+# shell scripts as-is: a CRLF checkout turns a shell assignment into a value
+# ending in CR, and the boot scripts then create directories such as
+# "/data/local/Droidspaces<CR>" and never find the daemon.
+* text=auto eol=lf

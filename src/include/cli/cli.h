@@ -24,6 +24,12 @@ int parse_and_validate_names(const char *optarg, char *out_buf,
 /* Every short flag. A letter missing here is rejected as an unknown option
  * even though long_options maps it, so keep the two in sync. */
 #define DS_OPTSTRING "r:i:n:h:d:fHXPISvVB:C:E:u:"
+
+/* Long-only, set by the Android app: the id its terminal tab already uses, so
+ * the keeper session and the tab share one name and closing the tab can end
+ * exactly that session. Never persisted. */
+#define DS_OPT_SESSION_ID 285
+
 extern const struct option long_options[];
 
 /* The CLI override pass. Idempotent over the same argv. */
