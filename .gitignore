@@ -10,6 +10,7 @@ output/
 *.config
 .cache
 .claude
+.workbuddy
 
 # Keystores
 *.keystore
@@ -24,5 +25,7 @@ compile_commands.json
 
 # Android stuff
 .gradle
+# A local assembleRelease output, not a source directory
+Android/app/release/
 # Python
 __pycache__/
