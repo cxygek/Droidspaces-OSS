@@ -29,6 +29,8 @@ int parse_and_validate_names(const char *optarg, char *out_buf,
  * the keeper session and the tab share one name and closing the tab can end
  * exactly that session. Never persisted. */
 #define DS_OPT_SESSION_ID 285
+/* The id of that one invocation, "" when it was not given. */
+const char *ds_cli_session_id(void);
 
 extern const struct option long_options[];
 

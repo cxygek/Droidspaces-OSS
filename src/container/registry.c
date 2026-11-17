@@ -388,7 +388,7 @@ int is_ds_monitor(pid_t p) {
     return 0;
   snprintf(path, sizeof(path), "/proc/%d/comm", (int)p);
   return read_file(path, comm, sizeof(comm)) >= 0 &&
-         strcmp(comm, "[ds-monitor]") == 0;
+         strcmp(comm, DS_MONITOR_PROC) == 0;
 }
 
 int is_valid_container_pid(pid_t pid) {

@@ -41,6 +41,36 @@ int ds_peer_in_pidns(pid_t peer_pid) {
   return strcmp(self_ns, peer_ns) == 0;
 }
 
+/* 1 when the listener behind connected fd is the process we meant to reach.
+ * SO_PEERCRED gives the pid that called listen, recorded then and never
+ * updated, so on its own it proves nothing: a container sharing the host
+ * network namespace can bind the name, let that process exit and keep the
+ * socket in a child until a host root process gets the pid. So the pid must be
+ * a root process in our PID namespace, named comm, and holding that very
+ * socket now. */
+int ds_socket_peer_is(int fd, const char *sock, const char *comm) {
+#ifdef SO_PEERCRED
+  struct ucred cred;
+  socklen_t clen = sizeof(cred);
+  memset(&cred, 0, sizeof(cred));
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0 ||
+      clen != sizeof(cred) || cred.uid != 0 || !ds_peer_in_pidns(cred.pid))
+    return 0;
+
+  char path[64], name[32] = "";
+  snprintf(path, sizeof(path), "/proc/%d/comm", (int)cred.pid);
+  if (read_file(path, name, sizeof(name)) < 0 || strcmp(name, comm) != 0)
+    return 0;
+
+  return ds_pid_holds_socket(cred.pid, ds_listener_inode(sock));
+#else
+  (void)fd;
+  (void)sock;
+  (void)comm;
+  return 0;
+#endif
+}
+
 int ds_peer_authorized(int fd, const char *group_name) {
 #ifdef SO_PEERCRED
   struct ucred cred;

@@ -90,6 +90,20 @@ void sanitize_container_name(const char *name, char *out, size_t size) {
   out[i] = '\0';
 }
 
+/* 1 when both names reach the same container: the display name and the
+ * sanitized one a -n argument may carry are the same container, and so are two
+ * spellings that only differ in spaces. */
+int same_container_name(const char *a, const char *b) {
+  if (!a || !b)
+    return 0;
+  if (strcmp(a, b) == 0)
+    return 1;
+  char sa[256], sb[256];
+  sanitize_container_name(a, sa, sizeof(sa));
+  sanitize_container_name(b, sb, sizeof(sb));
+  return strcmp(sa, sb) == 0;
+}
+
 int validate_container_name(const char *name) {
   if (!name || !name[0])
     return 0;

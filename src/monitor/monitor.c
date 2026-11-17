@@ -60,7 +60,7 @@ void ds_monitor_run(struct ds_config *cfg, int sync_pipe_write) {
    * domain -- still functional since droidspacesd is typepermissive. */
   ds_selinux_enter_domain();
 
-  prctl(PR_SET_NAME, "[ds-monitor]", 0, 0, 0);
+  prctl(PR_SET_NAME, DS_MONITOR_PROC, 0, 0, 0);
 
   /* The monitor takes new UTS and IPC namespaces now. The PID namespace is
    * NOT unshared here because unshare(CLONE_NEWPID) can only be called once
@@ -111,6 +111,12 @@ void ds_monitor_run(struct ds_config *cfg, int sync_pipe_write) {
    * Started only now: SELinux refuses the domain switch above from a
    * process with more than one thread. */
   ds_cmd_serve_start(cfg->container_name);
+
+  /* The container's terminal sessions are hosted here, not by the daemon: the
+   * monitor lives exactly as long as the container and outlives the app, so a
+   * session started by an app that then dies is still reachable. Bound before
+   * start returns, so the first enter can use it. */
+  ds_session_host_start(cfg->container_name);
 
 reboot_loop:;
   /* Close whatever is left of the previous cycle's pipes. The handshake
@@ -502,12 +508,13 @@ reboot_loop:;
        * poll() wakes immediately when the master becomes readable, so draining
        * is effectively real-time - a container init that fills the PTY buffer
        * is unblocked at once instead of wedging forever in n_tty_write. */
-      struct pollfd pfds[4];
+      struct pollfd pfds[6];
       int npfd = 0;
       int sfd_slot = -1;
       int con_slot = -1;
       int sock_slot = -1;
       int fwd_slot = -1;
+      int sess_slot = -1;
       if (sfd >= 0) {
         pfds[npfd].fd = sfd;
         pfds[npfd].events = POLLIN;
@@ -529,8 +536,19 @@ reboot_loop:;
         pfds[npfd].events = POLLIN;
         fwd_slot = npfd++;
       }
+      if (ds_session_host_fd() >= 0) {
+        pfds[npfd].fd = ds_session_host_fd();
+        pfds[npfd].events = POLLIN;
+        sess_slot = npfd++;
+      }
       if (npfd > 0) {
         poll(pfds, (nfds_t)npfd, 500);
+        /* Keepers that ended on their own, and an enter asking for one.
+         * Spawning a keeper and waiting for its socket takes a few ms, which
+         * this loop can afford: it is a user action, not a heartbeat. */
+        ds_session_host_reap();
+        if (sess_slot >= 0 && (pfds[sess_slot].revents & POLLIN))
+          ds_session_host_accept();
         if (sfd_slot >= 0 && (pfds[sfd_slot].revents & POLLIN)) {
           struct signalfd_siginfo si;
           while (read(sfd, &si, sizeof(si)) == (ssize_t)sizeof(si))
@@ -670,6 +688,11 @@ reboot_loop:;
      * so the command socket never hands out a dead pid. */
     cfg->container_pid = 0;
 
+    /* The shells behind this boot's keepers died with its init, so their
+     * sessions cannot be reattached to anything. Close the ptys before the
+     * next cycle starts building over them. */
+    ds_session_host_end_all();
+
     /* Reload from workspace (canonical path the user edits) */
     {
       free_config_binds(cfg);
@@ -726,6 +749,10 @@ reboot_loop:;
 
   /* Normal exit - monitor does cleanup */
   write_monitor_debug_log(cfg->container_name, "Monitor performing cleanup");
+
+  /* A keeper still holding a pty keeps this container's mount and cgroup busy,
+   * so the sessions go before the teardown does. */
+  ds_session_host_end_all();
 
   cleanup_container_resources(cfg, 0, 0, 0);
 

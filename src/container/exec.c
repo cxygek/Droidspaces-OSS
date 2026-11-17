@@ -97,22 +97,6 @@ static int exit_status(int st) {
  * 126 when it is there but cannot be run. Read errno before logging. */
 static int exec_exit_code(void) { return errno == ENOENT ? 127 : 126; }
 
-/* 0 when the child was reaped within timeout_ms, -1 when it still runs. */
-static int reap_child_timeout(pid_t pid, int timeout_ms, int *status) {
-  int waited = 0;
-  for (;;) {
-    pid_t r = waitpid(pid, status, WNOHANG);
-    if (r == pid)
-      return 0;
-    if (r < 0 && errno != EINTR)
-      return -1;
-    if (waited >= timeout_ms)
-      return -1;
-    usleep(20000);
-    waited += 20;
-  }
-}
-
 /* The intermediate is the session leader because login's vhangup() must not
  * reach the shell. That also means a shell which ignores the pty hangup can
  * outlive its client, so an explicit end has to take the session down. */
@@ -317,9 +301,9 @@ int enter_rootfs(struct ds_config *cfg, const char *user) {
    * the pts and a cgroup reference after the app is gone. */
   close(master_fd);
   int st;
-  if (reap_child_timeout(child, 200, &st) < 0) {
+  if (ds_reap_child(child, 200, &st) < 0) {
     kill(child, SIGTERM);
-    if (reap_child_timeout(child, 2000, &st) < 0) {
+    if (ds_reap_child(child, 2000, &st) < 0) {
       kill(child, SIGKILL);
       if (waitpid(child, &st, 0) < 0)
         st = 0;

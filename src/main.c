@@ -299,8 +299,13 @@ int main(int argc, char **argv) {
                           strcmp(discovered_cmd, "check") == 0));
 
   /* Session commands talk to a keeper directly and need this process's own
-   * terminal, so proxying them through the daemon would lose both. */
-  int is_local_cmd = (discovered_cmd && strcmp(discovered_cmd, "session") == 0);
+   * terminal, so proxying them through the daemon would lose both. enter is
+   * the same now: the container's monitor owns the session and this process
+   * holds the terminal, and the daemon is optional, so its death must not
+   * take a live shell with it. */
+  int is_local_cmd =
+      (discovered_cmd && (strcmp(discovered_cmd, "session") == 0 ||
+                          strcmp(discovered_cmd, "enter") == 0));
 
   if (!is_daemon_cmd && !is_no_root_cmd && !is_local_cmd &&
       getenv("DS_NO_PROXY") == NULL) {
@@ -471,6 +476,12 @@ int main(int argc, char **argv) {
              "'" C_BOLD "session kill <id>" C_RESET "'.",
              cfg.prog_name);
       ret = 1;
+    } else if (strcmp(action, "keeper") == 0) {
+      /* Internal: the container's monitor spawns this to hold one session.
+       * Its request and its answer travel on the fd the monitor passed, so
+       * there is nothing to parse here. */
+      ds_session_keeper_run();
+      ret = 0;
     } else if (strcmp(action, "list") == 0) {
       ret = ds_session_list(&cfg);
     } else if (strcmp(action, "attach") == 0) {
@@ -565,7 +576,18 @@ int main(int argc, char **argv) {
 
   if (strcmp(cmd, "enter") == 0) {
     const char *user = (optind + 1 < argc) ? argv[optind + 1] : "root";
-    ret = enter_rootfs(&cfg, user);
+    /* The enter a keeper starts behind its own pty is already the session: it
+     * goes straight in. Anything else asks the container's monitor for a
+     * session and only relays its terminal, so the shell outlives this
+     * process; a container whose monitor cannot host one keeps the old
+     * behaviour, a plain enter that ends with its client. */
+    if (getenv(DS_ENV_NO_SESSION)) {
+      ret = enter_rootfs(&cfg, user);
+    } else {
+      ret = ds_session_enter(&cfg, user, ds_cli_session_id());
+      if (ret == DS_SESSION_NO_KEEPER)
+        ret = enter_rootfs(&cfg, user);
+    }
     goto cleanup;
   }
 

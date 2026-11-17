@@ -117,6 +117,13 @@ int parse_and_validate_names(const char *optarg, char *out_buf,
   return 0;
 }
 
+/* --session-id names the terminal session of this one invocation. It is not
+ * part of the container's configuration and must never be written to one, so
+ * it lives here for the length of the command that read it. */
+static char g_session_id[DS_SESSION_ID_LEN + 1];
+
+const char *ds_cli_session_id(void) { return g_session_id; }
+
 const struct option long_options[] = {
     {"rootfs", required_argument, 0, 'r'},
     {"rootfs-img", required_argument, 0, 'i'},
@@ -198,6 +205,7 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
 
   /* Strict mode for 'run' prevents stealing arguments from the sub-command. */
   const char *optstring = strict ? "+" DS_OPTSTRING : DS_OPTSTRING;
+  g_session_id[0] = '\0';
 
   /* --reset must wipe the config BEFORE the other flags land on top, but
    * getopt hands us options in argv order. Scan for it first so
@@ -475,7 +483,8 @@ int ds_apply_cli_overrides(int argc, char **argv, struct ds_config *cfg,
       safe_strncpy(cfg->custom_init, optarg, sizeof(cfg->custom_init));
       break;
     case DS_OPT_SESSION_ID:
-      /* Consumed by the enter command's own parser; nothing to persist. */
+      /* Consumed by enter, which hands it to the container's monitor. */
+      safe_strncpy(g_session_id, optarg, sizeof(g_session_id));
       break;
     default:
       break;

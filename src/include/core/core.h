@@ -11,6 +11,8 @@
 /* exec.c */
 int run_command_quiet(char *const argv[]);
 int run_command_log(char *const argv[]);
+/* 0 when the child was reaped within timeout_ms, -1 when it still runs. */
+int ds_reap_child(pid_t pid, int timeout_ms, int *status);
 void ds_oom_protect(void);
 void ds_oom_unprotect(void);
 int ds_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg);
@@ -27,10 +29,35 @@ int ds_recv_fd(int sock);
 /* frame.c */
 struct sockaddr_un;
 
+#define DS_IOBUF 8192
+/* Client input queued toward a pty master: the daemon's pty sessions and a
+ * session keeper's both use this, and both suspend the client above HIGH. */
+#define PTY_WBUF_MAX (256 * 1024)
+#define PTY_WBUF_HIGH (192 * 1024)
+#define PTY_WBUF_LOW (64 * 1024)
+
+/* What a terminal session's socket carries. The daemon's per-command sessions,
+ * a keeper's session socket and the CLI that talks to either speak these. */
+#define MSG_OUT ((uint8_t)0x01)
+#define MSG_ERR ((uint8_t)0x02)
+#define MSG_WINCH ((uint8_t)0x03)
+#define MSG_SESSION_KILL ((uint8_t)0x04)
+#define MSG_EXIT ((uint8_t)0xFF)
+/* No exit code yet: the command behind the session still runs. */
+#define EXIT_PENDING (-1)
+
 int ds_read_exact(int fd, void *buf, size_t n);
 int ds_send_frame(int fd, uint8_t type, const void *data, uint32_t len);
 int ds_recv_frame_hdr(int fd, uint8_t *type_out, uint32_t *len_out);
+/* Read and throw away the payload of a frame this end does not handle. */
+void ds_drain_frame(int fd, uint32_t len);
 socklen_t ds_abstract_addr(struct sockaddr_un *addr, const char *name);
+
+/* Listening abstract sockets, read from /proc/net/unix: the kernel's own
+ * table, which nothing inside a container can write. */
+int ds_listener_next(FILE *f, char *name, size_t size, unsigned long *ino);
+unsigned long ds_listener_inode(const char *name);
+int ds_pid_holds_socket(pid_t pid, unsigned long ino);
 
 /* fs.c */
 int is_ramfs(const char *path);

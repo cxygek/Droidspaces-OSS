@@ -12,8 +12,6 @@
 #include <sys/time.h>
 #include <sys/un.h>
 
-#include "internal.h"
-
 /* Terminal session registry
  *
  * A keeper process owns the pty of an interactive enter session, not the
@@ -141,21 +139,25 @@ static int session_alive(const struct ds_session_record *rec) {
   return 1;
 }
 
-static int session_connect(const char *id) {
+/* The abstract name one session's keeper listens on. */
+static int session_sock_name(const char *id, char *buf, size_t size) {
   if (!ds_session_id_valid(id))
     return -1;
+  int n = snprintf(buf, size, "%s%s", DS_SESSION_SOCK_PREFIX, id);
+  return (n > 0 && (size_t)n < size) ? 0 : -1;
+}
 
-  char name[sizeof(DS_SESSION_SOCK_PREFIX) + DS_SESSION_ID_LEN];
-  int n = snprintf(name, sizeof(name), "%s%s", DS_SESSION_SOCK_PREFIX, id);
-  if (n < 0 || (size_t)n >= sizeof(name))
-    return -1;
-
+/* Connect to an abstract name with a bounded wait: a listener whose owner is
+ * wedged must not hang the command that asked. */
+static int session_connect(const char *name, int seconds) {
+  struct sockaddr_un addr;
+  socklen_t alen = ds_abstract_addr(&addr, name);
   int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (s < 0)
     return -1;
-
-  struct sockaddr_un addr;
-  socklen_t alen = ds_abstract_addr(&addr, name);
+  struct timeval tv = {seconds, 0};
+  (void)setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  (void)setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   if (connect(s, (struct sockaddr *)&addr, alen) < 0) {
     close(s);
     return -1;
@@ -163,20 +165,20 @@ static int session_connect(const char *id) {
   return s;
 }
 
-static void drain_frame(int sock, uint32_t len) {
-  char buf[DS_IOBUF];
-  while (len > 0) {
-    uint32_t chunk = len < sizeof(buf) ? len : (uint32_t)sizeof(buf);
-    if (ds_read_exact(sock, buf, chunk) < 0)
-      return;
-    len -= chunk;
-  }
-}
-
 static int session_send_kill(const char *id, int wait_exit) {
-  int sock = session_connect(id);
+  char name[sizeof(DS_SESSION_SOCK_PREFIX) + DS_SESSION_ID_LEN];
+  if (session_sock_name(id, name, sizeof(name)) < 0)
+    return -1;
+
+  int sock = session_connect(name, 2);
   if (sock < 0)
     return -1;
+  /* A squatter that bound this name would be handed the kill request and the
+   * answer that follows, so the peer must be the keeper itself. */
+  if (!ds_socket_peer_is(sock, name, DS_SESSION_PROC)) {
+    close(sock);
+    return -1;
+  }
 
   signal(SIGPIPE, SIG_IGN);
   if (ds_send_frame(sock, MSG_SESSION_KILL, NULL, 0) < 0) {
@@ -193,15 +195,15 @@ static int session_send_kill(const char *id, int wait_exit) {
     struct timeval tv = {2, 0};
     (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     for (;;) {
-      uint8_t type;
-      uint32_t len;
+      uint8_t type = 0;
+      uint32_t len = 0;
       if (ds_recv_frame_hdr(sock, &type, &len) < 0)
         break;
       if (type == MSG_EXIT)
         got_exit = 1;
       else if (type == MSG_ERR)
         got_error = 1;
-      drain_frame(sock, len);
+      ds_drain_frame(sock, len);
       if (got_exit)
         break;
     }
@@ -237,8 +239,18 @@ int ds_session_attach(const char *id) {
     return 1;
   }
 
-  int sock = session_connect(id);
+  char name[sizeof(DS_SESSION_SOCK_PREFIX) + DS_SESSION_ID_LEN];
+  if (session_sock_name(id, name, sizeof(name)) < 0) {
+    ds_error("Invalid session id: '%s'", id);
+    return 1;
+  }
+  int sock = session_connect(name, 2);
   if (sock < 0) {
+    ds_error("No terminal session with id '%s'.", id);
+    return 1;
+  }
+  if (!ds_socket_peer_is(sock, name, DS_SESSION_PROC)) {
+    close(sock);
     ds_error("No terminal session with id '%s'.", id);
     return 1;
   }
@@ -258,17 +270,90 @@ int ds_session_attach(const char *id) {
     return 1;
   }
 
+  /* The connect timeouts were there to bound the handshake. A session that
+   * sits idle for an hour must not be ended by them. */
+  struct timeval off = {0, 0};
+  (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &off, sizeof(off));
+  (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &off, sizeof(off));
+
   return ds_terminal_relay(sock, 1, 0);
 }
 
-/* The display name may differ from the sanitized one a -n argument uses. */
-static int same_container(const char *a, const char *b) {
-  if (strcmp(a, b) == 0)
+/* enter: ask the container's monitor for a keeper, then attach to the session
+ * it publishes. A container whose monitor does not answer, one started by a
+ * build that predates this, keeps the old behaviour: the caller runs a plain
+ * enter that survives nothing. */
+int ds_session_enter(struct ds_config *cfg, const char *user,
+                     const char *id_hint) {
+  if (!cfg->container_name[0])
+    return DS_SESSION_NO_KEEPER;
+  if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+    ds_error("Interactive terminal is required for the enter command");
     return 1;
-  char sa[256], sb[256];
-  sanitize_container_name(a, sa, sizeof(sa));
-  sanitize_container_name(b, sb, sizeof(sb));
-  return strcmp(sa, sb) == 0;
+  }
+
+  char sock_name[128];
+  ds_monitor_sock_name(cfg->container_name, DS_SESSION_CTL_LEAF, sock_name,
+                       sizeof(sock_name));
+  int fd = session_connect(sock_name, 5);
+  if (fd < 0)
+    return DS_SESSION_NO_KEEPER;
+  /* Any process may bind an abstract name. The request that follows describes
+   * a root shell, so the listener has to be this container's monitor. */
+  if (!ds_socket_peer_is(fd, sock_name, DS_MONITOR_PROC)) {
+    close(fd);
+    return DS_SESSION_NO_KEEPER;
+  }
+
+  struct ds_session_open req;
+  memset(&req, 0, sizeof(req));
+  safe_strncpy(req.container, cfg->container_name, sizeof(req.container));
+  safe_strncpy(req.user, user ? user : "root", sizeof(req.user));
+  /* The shell behind this session speaks this terminal. Without it the guest
+   * inherited the TERM of whatever started the container, which is a bare adb
+   * or libsu shell when nobody started it from a terminal. Only a terminfo
+   * name is accepted, so nothing else rides into the keeper's environment. */
+  {
+    const char *term = getenv("TERM");
+    size_t n = 0;
+    for (; term && term[n] && n + 1 < sizeof(req.term); n++) {
+      unsigned char c = (unsigned char)term[n];
+      if (!(isalnum(c) || c == '-' || c == '_' || c == '+' || c == '.'))
+        break;
+      req.term[n] = (char)c;
+    }
+    req.term[n] = '\0';
+    if (!req.term[0])
+      safe_strncpy(req.term, "xterm-256color", sizeof(req.term));
+  }
+  if (id_hint && id_hint[0])
+    safe_strncpy(req.id, id_hint, sizeof(req.id));
+  struct winsize ws = {24, 80, 0, 0};
+  (void)ioctl(STDIN_FILENO, TIOCGWINSZ, &ws);
+  req.rows = ws.ws_row ? ws.ws_row : 24;
+  req.cols = ws.ws_col ? ws.ws_col : 80;
+
+  signal(SIGPIPE, SIG_IGN);
+
+  struct ds_session_answer ans;
+  uint8_t type = 0;
+  uint32_t len = 0;
+  int ok = ds_send_frame(fd, DS_SESS_OPEN, &req, sizeof(req)) == 0 &&
+           ds_recv_frame_hdr(fd, &type, &len) == 0 &&
+           (type == DS_SESS_OK || type == DS_SESS_FAIL) && len == sizeof(ans) &&
+           ds_read_exact(fd, &ans, sizeof(ans)) == 0;
+  close(fd);
+  if (!ok)
+    return DS_SESSION_NO_KEEPER;
+  if (!ans.ok) {
+    ds_error("%s", ans.msg[0] ? ans.msg : "The monitor refused the session.");
+    return 1;
+  }
+  if (!ds_session_id_valid(ans.id)) {
+    ds_error("The monitor published an unusable session id.");
+    return 1;
+  }
+  return ds_session_attach(ans.id);
 }
 
 void ds_session_kill_container(const char *name) {
@@ -307,7 +392,7 @@ void ds_session_kill_container(const char *name) {
      * one being stopped; the cgroup teardown still takes its shell with the
      * container. */
     if (name && name[0] &&
-        (!rec.container[0] || !same_container(rec.container, name)))
+        (!rec.container[0] || !same_container_name(rec.container, name)))
       continue;
 
     (void)session_send_kill(rec.id, 1);
@@ -358,7 +443,7 @@ int ds_session_list(struct ds_config *cfg) {
         continue;
       }
       if (cfg->container_name[0] && rec.container[0] &&
-          !same_container(rec.container, cfg->container_name))
+          !same_container_name(rec.container, cfg->container_name))
         continue;
 
       if (count == cap) {

@@ -70,6 +70,7 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/tty/pty.c \
        $(SRC_DIR)/tty/proxy.c \
        $(SRC_DIR)/tty/console.c \
+       $(SRC_DIR)/tty/relay.c \
        $(SRC_DIR)/net/nl/core.c \
        $(SRC_DIR)/net/nl/probe.c \
        $(SRC_DIR)/net/nl/link.c \
@@ -122,6 +123,7 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/android/android.c \
        $(SRC_DIR)/boot/init.c \
        $(SRC_DIR)/boot/env.c \
+       $(SRC_DIR)/monitor/session.c \
        $(SRC_DIR)/monitor/console.c \
        $(SRC_DIR)/monitor/monitor.c \
        $(SRC_DIR)/cli/docs.c \
@@ -129,7 +131,7 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/daemon/session.c \
        $(SRC_DIR)/daemon/server.c \
        $(SRC_DIR)/daemon/client.c \
-       $(SRC_DIR)/daemon/sessions.c \
+       $(SRC_DIR)/session/registry.c \
        $(SRC_DIR)/cli/check.c \
        $(SRC_DIR)/android/x11.c \
        $(SRC_DIR)/android/virgl.c \

@@ -23,23 +23,27 @@
 /* A booted config never comes near this; it only bounds what we allocate */
 #define DS_CMD_REPLY_MAX (1024 * 1024)
 
-/* droidspaces/<safe name>/command, or droidspaces/#<hash>/command for a name
+/* droidspaces/<safe name>/<leaf>, or droidspaces/#<hash>/<leaf> for a name
  * that would not fit in sun_path. The name is never trusted from the socket
  * either way: discovery asks the monitor for its config, name included. */
-static void cmd_sock_name(const char *name, char *out, size_t size) {
+void ds_monitor_sock_name(const char *name, const char *leaf, char *out,
+                          size_t size) {
   char safe[256];
   struct sockaddr_un probe;
   sanitize_container_name(name, safe, sizeof(safe));
-  if (strlen(DS_CMD_PREFIX) + strlen(safe) + strlen(DS_CMD_SUFFIX) <
+  if (strlen(DS_CMD_PREFIX) + strlen(safe) + strlen(leaf) <
       sizeof(probe.sun_path) - 1) {
-    snprintf(out, size, DS_CMD_PREFIX "%s" DS_CMD_SUFFIX, safe);
+    snprintf(out, size, DS_CMD_PREFIX "%s/%s", safe, leaf);
     return;
   }
   uint64_t h = 1469598103934665603ULL; /* FNV-1a 64 */
   for (const unsigned char *c = (const unsigned char *)safe; *c; c++)
     h = (h ^ *c) * 1099511628211ULL;
-  snprintf(out, size, DS_CMD_PREFIX "#%016llx" DS_CMD_SUFFIX,
-           (unsigned long long)h);
+  snprintf(out, size, DS_CMD_PREFIX "#%016llx/%s", (unsigned long long)h, leaf);
+}
+
+static void cmd_sock_name(const char *name, char *out, size_t size) {
+  ds_monitor_sock_name(name, "command", out, size);
 }
 
 static void set_timeouts(int fd, int seconds) {
@@ -194,61 +198,6 @@ void ds_cmd_serve_start(const char *name) {
     pthread_detach(tid);
 }
 
-/* The next listener on an abstract name in the kernel's table of unix
- * sockets: its name without the '@', and its inode. Lines are Num RefCount
- * Protocol Flags Type St Inode Path. Listening sockets carry __SO_ACCEPTCON
- * in Flags, 00010000; their accepted connections show the same path and are
- * skipped. Only our network namespace's sockets are listed, and an abstract
- * name has one listener in it. */
-static int next_listener(FILE *f, char path[256], unsigned long *ino) {
-  char line[512], flags[16];
-  while (fgets(line, sizeof(line), f))
-    if (sscanf(line, "%*s %*s %*s %15s %*s %*s %lu %255s", flags, ino, path) ==
-            3 &&
-        strcmp(flags, "00010000") == 0 && path[0] == '@') {
-      memmove(path, path + 1, strlen(path));
-      return 1;
-    }
-  return 0;
-}
-
-/* The inode of the socket listening on the abstract name sock, or 0 */
-static unsigned long listener_inode(const char *sock) {
-  FILE *f = fopen("/proc/net/unix", "re");
-  if (!f)
-    return 0;
-  char path[256];
-  unsigned long ino, found = 0;
-  while (!found && next_listener(f, path, &ino))
-    if (strcmp(path, sock) == 0)
-      found = ino;
-  fclose(f);
-  return found;
-}
-
-/* 1 if pid holds the socket with inode ino among its open fds */
-static int holds_socket(pid_t pid, unsigned long ino) {
-  char dir[64], want[64];
-  snprintf(dir, sizeof(dir), "/proc/%d/fd", (int)pid);
-  snprintf(want, sizeof(want), "socket:[%lu]", ino);
-  DIR *d = ino ? opendir(dir) : NULL;
-  if (!d)
-    return 0;
-  int held = 0;
-  struct dirent *e;
-  while (!held && (e = readdir(d)) != NULL) {
-    char path[320], link[64];
-    snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-    ssize_t n = readlink(path, link, sizeof(link) - 1);
-    if (n > 0) {
-      link[n] = '\0';
-      held = strcmp(link, want) == 0;
-    }
-  }
-  closedir(d);
-  return held;
-}
-
 /* 1 if the listener behind connected fd is a monitor of ours. SO_PEERCRED
  * gives the pid that called listen, recorded then and never updated, so on
  * its own it proves nothing: a container sharing the host network namespace
@@ -260,7 +209,8 @@ static pid_t server_is_monitor(int fd, const char *sock, unsigned long ino) {
   socklen_t len = sizeof(cred);
   return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
                  cred.uid == 0 && is_ds_monitor(cred.pid) &&
-                 holds_socket(cred.pid, ino ? ino : listener_inode(sock))
+                 ds_pid_holds_socket(cred.pid,
+                                     ino ? ino : ds_listener_inode(sock))
              ? cred.pid
              : 0;
 }
@@ -364,7 +314,7 @@ int ds_cmd_for_each(void (*visit)(struct ds_config *booted, pid_t pid,
   char sock[256];
   unsigned long ino;
   int visited = 0;
-  while (next_listener(f, sock, &ino)) {
+  while (ds_listener_next(f, sock, sizeof(sock), &ino)) {
     size_t n = strlen(sock), sl = strlen(DS_CMD_SUFFIX);
     if (strncmp(sock, DS_CMD_PREFIX, strlen(DS_CMD_PREFIX)) != 0 || n <= sl ||
         strcmp(sock + n - sl, DS_CMD_SUFFIX) != 0)

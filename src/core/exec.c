@@ -38,6 +38,25 @@ static int internal_run(char *const argv[], int quiet) {
 
 int run_command_quiet(char *const argv[]) { return internal_run(argv, 1); }
 
+/* 0 when the child was reaped within timeout_ms, -1 when it still runs. A pty
+ * closes under a command that a hangup alone does not always end, so both the
+ * daemon's sessions and a session keeper bound how long they wait before
+ * signalling. */
+int ds_reap_child(pid_t pid, int timeout_ms, int *status) {
+  int waited = 0;
+  for (;;) {
+    pid_t r = waitpid(pid, status, WNOHANG);
+    if (r == pid)
+      return 0;
+    if (r < 0 && errno != EINTR)
+      return -1;
+    if (waited >= timeout_ms)
+      return -1;
+    usleep(20000);
+    waited += 20;
+  }
+}
+
 /* run_command_log: runs argv, captures stderr and emits it via ds_log so
  * iptables error messages are visible in the droidspaces log on failure. */
 int run_command_log(char *const argv[]) {

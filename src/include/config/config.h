@@ -198,6 +198,8 @@ struct ds_config {
 
 /* config.c */
 void sanitize_container_name(const char *name, char *out, size_t size);
+/* 1 when both spellings name the same container, spacing aside. */
+int same_container_name(const char *a, const char *b);
 int validate_container_name(const char *name);
 int reject_container_name(const char *name);
 

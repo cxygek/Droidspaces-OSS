@@ -160,6 +160,7 @@
 #include "monitor/monitor.h"
 #include "rootfs/rootfs.h"
 #include "security/security.h"
+#include "session/session.h"
 #include "status/status.h"
 #include "tty/tty.h"
 #include "virt/virt.h"

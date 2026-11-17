@@ -27,6 +27,12 @@ void cleanup_container_resources(struct ds_config *cfg, pid_t pid,
 void ds_cmd_serve_start(const char *name);
 void ds_cmd_publish(struct ds_config *cfg);
 
+/* The abstract name a monitor listens on for one of its leaves: "command" for
+ * what it answers about this boot, "session" for its terminal sessions. A name
+ * too long for sun_path is hashed, so both leaves of one container agree. */
+void ds_monitor_sock_name(const char *name, const char *leaf, char *out,
+                          size_t size);
+
 /* Client side. Both fail (-1, 0) when no monitor of ours answers, for example
  * one started by an older build: callers fall back to the host config. */
 int ds_cmd_get_config(const char *name, struct ds_config *cfg, pid_t *pid);

@@ -25,6 +25,11 @@ int ds_peer_in_pidns(pid_t peer_pid);
 /* Authorize a connected AF_UNIX peer: allow root, or a member of group_name,
  * but only when the peer shares our PID namespace.  Returns 1 if authorized. */
 int ds_peer_authorized(int fd, const char *group_name);
+/* 1 when the process listening on the abstract socket sock is a root host
+ * process named comm and still holds that listener. Stricter than
+ * ds_peer_authorized, for the caller side: a squatter that bound the name has
+ * neither the name nor the socket. */
+int ds_socket_peer_is(int fd, const char *sock, const char *comm);
 
 /* seccomp.c */
 int ds_seccomp_apply_minimal(int privileged_mask, int sandboxing_allowed);

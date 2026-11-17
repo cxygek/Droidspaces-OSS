@@ -203,9 +203,10 @@ static void print_page(int page, const char *bin) {
     p_printf("  %s --name=mycontainer --json session list\n", bin);
     p_printf("  %s session attach <id>\n", bin);
     p_printf("  %s session kill <id>\n", bin);
-    p_printf("  (An enter shell is owned by a daemon keeper, not by the\n");
-    p_printf("   client that opened it. Closing the app leaves it running,\n");
-    p_printf("   and session attach brings the same terminal back.)\n\n");
+    p_printf("  (An enter shell is owned by the container's monitor, not by\n");
+    p_printf("   the client that opened it. Closing the app leaves it\n");
+    p_printf(
+        "   running, and session attach brings the same terminal back.)\n\n");
 
     p_printf("%sListing Containers (JSON):%s\n", bold, reset);
     p_printf("  %s --json show\n", bin);

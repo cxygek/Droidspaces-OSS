@@ -54,9 +54,14 @@ Run `adb devices` first, every time. If no line ends in `device`, stop and say s
 
 ### Running a test build without touching the daemon
 
-On the phone the CLI forwards every command to the running `droidspaces daemon`, and the
+On the phone the CLI forwards most commands to the running `droidspaces daemon`, and the
 daemon serves it with its own installed binary (`/data/local/Droidspaces/bin/droidspaces`).
 A freshly pushed build called by absolute path therefore still runs the installed code.
+
+`enter` and `session` are the exceptions: they run in the process you invoked and talk to
+the container's monitor, which is what keeps a terminal session alive when the app (or the
+daemon) dies. A pushed `enter` therefore enters through the monitor the pushed `start`
+created, and the keeper behind it is that same binary.
 
 `DS_NO_PROXY=1` skips the forwarding, so the binary you invoked does the work itself. The
 daemon keeps running and nothing gets reinstalled.

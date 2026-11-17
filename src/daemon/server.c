@@ -103,7 +103,6 @@ static void handle_conn(int conn) {
   char **av = make_exec_argv(&req);
   const char *cmd = av ? ds_command_word(req.argc + 1, av) : NULL;
   free(av);
-  int is_enter = cmd && strcmp(cmd, "enter") == 0;
   if (cmd && (strcmp(cmd, "daemon") == 0 || strcmp(cmd, "client") == 0)) {
     ds_send_frame(conn, MSG_ERR, "daemon: recursive call refused\n", 31);
     send_exit(conn, 1);
@@ -127,10 +126,10 @@ static void handle_conn(int conn) {
     ds_log("Executing command: %s", cmdline);
   }
 
-  if (is_enter && (req.flags & REQ_FLAG_PTY))
-    handle_session_enter(&conn, &req);
-  else
-    handle_session(&conn, &req);
+  /* enter no longer comes through here: it is a local command that asks the
+   * container's monitor for a session, so a request that still arrives (from
+   * a client older than this build) is served as a plain pty session. */
+  handle_session(conn, &req);
 
   ds_log("Session finished. Client disconnected.");
   free_req(&req);
