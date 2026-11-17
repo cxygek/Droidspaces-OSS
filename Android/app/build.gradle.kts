@@ -146,8 +146,9 @@ tasks.register<Copy>("generateBootModule") {
     inputs.property("versionCode", dsVersionCodeVal)
 }
 
-// The backend the APK ships. make is incremental, so an unchanged src/ costs one no-op per arch
-val phoneArches = listOf("aarch64", "armhf", "x86_64", "x86")
+// The backend the APK ships. make is incremental, so an unchanged src/ costs one no-op per arch.
+// ARM only: no Android device runs x86, so those two builds would ship bytes nothing can load
+val phoneArches = listOf("aarch64", "armhf")
 val isWindowsHost = System.getProperty("os.name").orEmpty().contains("windows", ignoreCase = true)
 val buildBackend = tasks.register<Exec>("buildBackend") {
     workingDir(repo)

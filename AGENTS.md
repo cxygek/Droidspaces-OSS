@@ -11,9 +11,9 @@ Droidspaces is a container runtime. Two halves:
 - `src/` is the C backend, statically linked against musl, one binary for Android and Linux.
 - `Android/` is the Compose app that drives that binary over a root shell.
 
-The compiled backend ships inside the APK. Gradle runs `make` for the four phone arches and
-packages `output/droidspaces-<arch>` as a generated asset, so the APK always carries the
-backend from the tree it was built from.
+The compiled backend ships inside the APK. Gradle runs `make` for the two phone arches, aarch64
+and armhf, and packages `output/droidspaces-<arch>` as a generated asset, so the APK always
+carries the backend from the tree it was built from.
 
 ## Build
 
