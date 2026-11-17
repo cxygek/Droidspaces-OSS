@@ -57,8 +57,14 @@ void ds_env_boot_setup(struct ds_config *cfg) {
   if (saved_term && saved_term[0]) {
     /* Bug fix: TWRP terminal leaks internal variables like 'bg1.25' as TERM.
      * Some recovery environments/kernels also set TERM to version strings.
-     * If it contains dots or appears to be a garbage value, use the default. */
-    if (strchr(saved_term, '.') || strncmp(saved_term, "bg", 2) == 0) {
+     * 'dumb' is what a bare adb or libsu shell exports, and it describes that
+     * shell, not the container: a service inheriting it loses colour and line
+     * editing for no reason. All three are treated as "no usable terminal",
+     * which is what an unset TERM already means here. A container that really
+     * wants 'dumb' sets it in its env, which is applied after these defaults.
+     */
+    if (strchr(saved_term, '.') || strncmp(saved_term, "bg", 2) == 0 ||
+        strcmp(saved_term, "dumb") == 0) {
       /* likely garbage - keep default xterm-256color */
     } else {
       safe_strncpy(term_buf, saved_term, sizeof(term_buf));
