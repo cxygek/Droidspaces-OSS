@@ -31,9 +31,11 @@ import com.droidspaces.app.ui.util.rememberAnimatedEntries
 import com.droidspaces.app.ui.viewmodel.ContainerViewModel
 import com.droidspaces.app.ui.viewmodel.SystemStatsViewModel
 import com.droidspaces.app.util.AnlandUtils
+import com.droidspaces.app.util.TerminalSessionManager
 import com.droidspaces.app.util.TermuxX11Utils
 import androidx.compose.ui.platform.LocalContext
 import com.droidspaces.app.R
+import kotlinx.coroutines.delay
 
 /**
  * Control Panel screen - shows system stats and running containers.
@@ -61,6 +63,21 @@ fun ControlPanelScreen(
     val entries = rememberAnimatedEntries(runningContainers) { it.name }
 
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    // Containers whose shell outlived the app. The card used to read only the
+    // in-process registry, which is empty right after a kill, so a live session
+    // showed up as a plain Terminal. One backend call covers every card, and it
+    // is re-read while the tab is visible: a session ends on its own when the
+    // shell exits, and nothing local would notice.
+    var restoreContainers by remember { mutableStateOf(emptySet<String>()) }
+    LaunchedEffect(Unit) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                restoreContainers = TerminalSessionManager.containersWithSessions()
+                delay(10_000)
+            }
+        }
+    }
 
     // Poll only while this screen is composed (i.e. the Panel tab is selected)
     // AND the app is in the foreground (Lifecycle STARTED).  repeatOnLifecycle
@@ -140,6 +157,7 @@ fun ControlPanelScreen(
                                                 scope.showError(snackbarHostState, context.getString(R.string.termux_x11_not_installed))
                                         },
                                         osInfo = containerUsageMap[container.name],
+                                        hasBackendSession = container.name in restoreContainers,
                                     )
                                 }
                             }

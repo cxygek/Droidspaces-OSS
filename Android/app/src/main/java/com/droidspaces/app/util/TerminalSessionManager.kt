@@ -31,7 +31,7 @@ object TerminalSessionManager {
      * the installed backend predates session management, so the caller can fall
      * back to opening a new shell.
      */
-    suspend fun listSessions(containerName: String): List<BackendSession> =
+    suspend fun listSessions(containerName: String? = null): List<BackendSession> =
         withContext(Dispatchers.IO) {
             try {
                 val command = ContainerCommandBuilder.buildSessionListCommand(containerName)
@@ -56,6 +56,15 @@ object TerminalSessionManager {
                 emptyList()
             }
         }
+
+    /**
+     * Containers that still have a keeper session behind them, in one backend
+     * call. The panel reads this because its own registry lives in the process:
+     * after the app is killed the shells are still there, but nothing local
+     * remembers them, and the card has to say so.
+     */
+    suspend fun containersWithSessions(): Set<String> =
+        listSessions().map { it.container }.filter { it.isNotEmpty() }.toSet()
 
     /**
      * End one backend session. Fire and forget: closing a tab must not wait for

@@ -52,9 +52,15 @@ object ContainerCommandBuilder {
     /** JSON of every kernel capability probe, one 0/1 per key. */
     fun buildCheckCommand(): String = "$DROIDSPACES_BINARY_PATH --json check"
 
-    /** JSON of the keeper sessions of one container, oldest first. */
-    fun buildSessionListCommand(containerName: String): String =
-        "$DROIDSPACES_BINARY_PATH --name=${quote(containerName)} --json session list"
+    /** JSON of the keeper sessions of one container, oldest first. A null name
+     * asks for every container at once, which is one root shell instead of one
+     * per card. */
+    fun buildSessionListCommand(containerName: String?): String =
+        if (containerName == null) {
+            "$DROIDSPACES_BINARY_PATH --json session list"
+        } else {
+            "$DROIDSPACES_BINARY_PATH --name=${quote(containerName)} --json session list"
+        }
 
     /** End one keeper session by its backend id. */
     fun buildSessionKillCommand(sessionId: String): String =

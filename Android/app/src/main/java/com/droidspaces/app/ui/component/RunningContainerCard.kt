@@ -39,6 +39,10 @@ fun RunningContainerCard(
     displayIcon: Painter? = null,
     onLaunchDisplay: () -> Unit = {},
     osInfo: ContainerOSInfoManager.OSInfo? = null,
+    // A keeper session for this container still runs in the backend, so the
+    // terminal opens a live shell instead of a new one. Comes from the panel's
+    // session scan, which is the only source that survives the app being killed.
+    hasBackendSession: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -118,6 +122,10 @@ fun RunningContainerCard(
                         }
                     }
                 }
+                // Two sources, because they answer different questions: the
+                // registry knows the tabs this process holds, the backend knows
+                // the shells that outlived the last process.
+                val canRestore = sessionCount > 0 || hasBackendSession
                 Surface(
                     onClick = onTerminalClick,
                     shape = RoundedCornerShape(12.dp), // Sharper, refined radius
@@ -132,13 +140,13 @@ fun RunningContainerCard(
                         horizontalArrangement = Arrangement.Center
                     ) {
                         Icon(
-                            imageVector = if (sessionCount > 0) Icons.Default.Terminal else Icons.Default.ChevronRight,
+                            imageVector = if (canRestore) Icons.Default.Terminal else Icons.Default.ChevronRight,
                             contentDescription = null,
                             modifier = Modifier.size(14.dp) // Slightly smaller icon
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = if (sessionCount > 0) context.getString(R.string.restore) else context.getString(R.string.terminal),
+                            text = if (canRestore) context.getString(R.string.restore) else context.getString(R.string.terminal),
                             style = MaterialTheme.typography.labelMedium, // More compact typography
                             fontWeight = FontWeight.Bold
                         )
