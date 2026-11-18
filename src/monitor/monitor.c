@@ -456,7 +456,7 @@ reboot_loop:;
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_BLOCK, &mask, NULL);
     int sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
-    int gw_wired = 0, net_tick = 0;
+    int gw_wired = 0, net_tick = 0, forwards_done = 0;
     struct timespec last_tick = {0, 0};
 
     while (1) {
@@ -508,6 +508,14 @@ reboot_loop:;
          * Every monitor runs this; the state lock keeps one of them working. */
         if (ds_hostlan_configured() && ++net_tick % 8 == 0)
           ds_hostlan_reconcile();
+
+        /* The port forwards live in the kernel too, and a reboot takes them
+         * with it. The first monitor to run puts them back, so a container
+         * that autostarts is reachable without the app being opened. */
+        if (!forwards_done) {
+          forwards_done = 1;
+          ds_hostnet_forwards_apply();
+        }
       }
 
       /* Poll the signalfd and, in background mode, the console PTY master.

@@ -42,6 +42,7 @@ void print_usage(void) {
          "  net status                The host's own membership in a container LAN\n"
          "  net join [bridge]         Plug the host into a container LAN (default ds-lan)\n"
          "  net leave                 Unplug the host from the container LAN\n"
+         "  net forwards              Put the saved port forwards back in the kernel\n"
          "  check                     Check system requirements\n"
          "  docs                      Show interactive documentation\n"
          "  help                      Show this help message\n"

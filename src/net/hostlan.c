@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <poll.h>
 #include <spawn.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,14 @@
 extern char **environ;
 
 #define HOSTLAN_CONF "hostlan.conf"
+#define HOSTLAN_FORWARDS "forwards.conf"
+#define HOSTLAN_FORWARDS_SWITCH "forwarding.conf"
+
+/* The chains and comment tag the app writes with; the two must agree or the
+ * app would show rules the kernel does not have. */
+#define PF_CHAIN_NAT "DSPF_NAT"
+#define PF_CHAIN_FWD "DSPF_FWD"
+#define PF_TAG "dspaces:net"
 #define HOSTLAN_LEASE "hostlan.lease"
 #define HOSTLAN_PID "hostlan.pid"
 #define HOSTLAN_LOCK "hostlan.lock"
@@ -741,6 +750,169 @@ int ds_hostlan_dhcp_run(void) {
 
   close(sock);
   return 0;
+}
+
+/* Port forwards ----------------------------------------------------------- */
+
+/* One shell per command: the rule text is built from numbers and addresses we
+ * parsed ourselves, so there is nothing here for a shell to interpret. */
+static int pf_sh(const char *fmt, ...) {
+  char cmd[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(cmd, sizeof(cmd), fmt, ap);
+  va_end(ap);
+  char *const argv[] = {"sh", "-c", (char *)cmd, NULL};
+  return run_command_quiet(argv);
+}
+
+static int pf_wait_flag(void) {
+  static int known = -1;
+  if (known < 0)
+    known = pf_sh("iptables -w -L -n >/dev/null 2>&1") == 0 ? 1 : 0;
+  return known;
+}
+
+static int pf_enabled(void) {
+  char path[PATH_MAX], buf[128] = {0};
+  net_file(HOSTLAN_FORWARDS_SWITCH, path, sizeof(path));
+  if (read_file(path, buf, sizeof(buf)) <= 0)
+    return 1; /* nobody turned it off */
+  const char *value = strchr(buf, '=');
+  if (!value)
+    return 1;
+  value++;
+  while (*value == ' ')
+    value++;
+  if (*value == '0')
+    return 0;
+  if (strncmp(value, "off", 3) == 0 || strncmp(value, "false", 5) == 0 ||
+      strncmp(value, "no", 2) == 0)
+    return 0;
+  return 1;
+}
+
+static int pf_chains_exist(void) {
+  return pf_sh("iptables %s -t nat -S %s >/dev/null 2>&1",
+               pf_wait_flag() ? "-w" : "", PF_CHAIN_NAT) == 0;
+}
+
+static void pf_ensure_chains(void) {
+  const char *w = pf_wait_flag() ? "-w" : "";
+  pf_sh("iptables %s -t nat -N %s 2>/dev/null", w, PF_CHAIN_NAT);
+  pf_sh("iptables %s -N %s 2>/dev/null", w, PF_CHAIN_FWD);
+  pf_sh("iptables %s -t nat -C PREROUTING -j %s >/dev/null 2>&1 || "
+        "iptables %s -t nat -I PREROUTING 1 -j %s", w, PF_CHAIN_NAT, w, PF_CHAIN_NAT);
+  pf_sh("iptables %s -C FORWARD -j %s >/dev/null 2>&1 || "
+        "iptables %s -I FORWARD 1 -j %s", w, PF_CHAIN_FWD, w, PF_CHAIN_FWD);
+}
+
+static void pf_flush_chains(void) {
+  const char *w = pf_wait_flag() ? "-w" : "";
+  pf_sh("iptables %s -t nat -F %s 2>/dev/null", w, PF_CHAIN_NAT);
+  pf_sh("iptables %s -F %s 2>/dev/null", w, PF_CHAIN_FWD);
+}
+
+/* The subnet a forwarded connection comes back from, once there is a lease. */
+static void pf_subnet(char *out, size_t size) {
+  struct hostlan_lease lease;
+  out[0] = '\0';
+  if (!lease_read(&lease))
+    return;
+  uint32_t network = ntohl(lease.ip_be) & ntohl(lease.mask_be);
+  uint8_t prefix = mask_to_prefix(lease.mask_be);
+  snprintf(out, size, "%u.%u.%u.%u/%u", (network >> 24) & 0xFF,
+           (network >> 16) & 0xFF, (network >> 8) & 0xFF, network & 0xFF,
+           (unsigned)prefix);
+}
+
+static int pf_add_rule(const char *proto, int host_port, const char *ip,
+                       int container_port) {
+  const char *w = pf_wait_flag() ? "-w" : "";
+  char dnat[256], accept[256];
+
+  snprintf(dnat, sizeof(dnat),
+           "-t nat -C %s -p %s --dport %d -m comment --comment %s -j DNAT "
+           "--to-destination %s:%d",
+           PF_CHAIN_NAT, proto, host_port, PF_TAG, ip, container_port);
+  if (pf_sh("iptables %s %s >/dev/null 2>&1", w, dnat) != 0) {
+    if (pf_sh("iptables %s -t nat -A %s -p %s --dport %d -m comment "
+              "--comment %s -j DNAT --to-destination %s:%d",
+              w, PF_CHAIN_NAT, proto, host_port, PF_TAG, ip, container_port) != 0)
+      return 0;
+
+    /* Android's tethering rules drop forwarded packets; without this the DNAT
+     * matches and the packet still dies in FORWARD. */
+    for (int i = 0; i < 8; i++)
+      if (pf_sh("iptables %s -D tetherctrl_FORWARD -j DROP 2>/dev/null", w) != 0)
+        break;
+  }
+
+  snprintf(accept, sizeof(accept),
+           "-C %s -p %s -d %s --dport %d -m comment --comment %s -j ACCEPT",
+           PF_CHAIN_FWD, proto, ip, container_port, PF_TAG);
+  if (pf_sh("iptables %s %s >/dev/null 2>&1", w, accept) != 0)
+    pf_sh("iptables %s -A %s -p %s -d %s --dport %d -m comment --comment %s "
+          "-j ACCEPT", w, PF_CHAIN_FWD, proto, ip, container_port, PF_TAG);
+  return 1;
+}
+
+/* Put the saved forwards back in the kernel. Idempotent: every rule is checked
+ * before it is added, so this can run on every container start. Returns the
+ * number of rules the file holds. */
+int ds_hostnet_forwards_apply(void) {
+  if (!pf_enabled()) {
+    if (pf_chains_exist())
+      pf_flush_chains();
+    return 0;
+  }
+
+  char path[PATH_MAX];
+  static char buf[8192];
+  net_file(HOSTLAN_FORWARDS, path, sizeof(path));
+  if (read_file(path, buf, sizeof(buf)) <= 0) {
+    /* No list yet: nothing to install and no reason to leave chains behind. */
+    if (pf_chains_exist())
+      pf_flush_chains();
+    return 0;
+  }
+
+  char subnet[32];
+  pf_subnet(subnet, sizeof(subnet));
+
+  int applied = 0;
+  for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n")) {
+    while (*line == ' ')
+      line++;
+    if (*line == '\0' || *line == '#')
+      continue;
+
+    char proto[8] = {0}, ip[INET_ADDRSTRLEN] = {0}, container[64] = {0};
+    int host_port = 0, container_port = 0;
+    if (sscanf(line, "%7[^|]|%d|%63[^|]|%15[^|]|%d", proto, &host_port,
+               container, ip, &container_port) != 5)
+      continue;
+    if ((strcmp(proto, "tcp") != 0 && strcmp(proto, "udp") != 0) ||
+        host_port < 1 || host_port > 65535 || container_port < 1 ||
+        container_port > 65535)
+      continue;
+
+    pf_ensure_chains();
+    if (pf_add_rule(proto, host_port, ip, container_port))
+      applied++;
+
+    if (subnet[0]) {
+      const char *w = pf_wait_flag() ? "-w" : "";
+      char masq[256];
+      snprintf(masq, sizeof(masq),
+               "-t nat -C POSTROUTING -s %s ! -d %s -m comment --comment "
+               "%s:masq -j MASQUERADE", subnet, subnet, PF_TAG);
+      if (pf_sh("iptables %s %s >/dev/null 2>&1", w, masq) != 0)
+        pf_sh("iptables %s -t nat -A POSTROUTING -s %s ! -d %s -m comment "
+              "--comment %s:masq -j MASQUERADE", w, subnet, subnet, PF_TAG);
+    }
+  }
+  return applied;
 }
 
 /* Join / leave ------------------------------------------------------------ */

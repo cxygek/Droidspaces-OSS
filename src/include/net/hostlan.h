@@ -51,6 +51,11 @@ int ds_hostlan_configured(void);
  * keeper. Idempotent and cheap; called from the container monitors. */
 void ds_hostlan_reconcile(void);
 
+/* Put the saved port forwards back in the kernel. Idempotent, so a container
+ * that autostarts can call it without the app ever running. Returns how many
+ * rules the saved list holds. */
+int ds_hostnet_forwards_apply(void);
+
 /* Internal: the lease keeper, spawned by join as "net dhcp". */
 int ds_hostlan_dhcp_run(void);
 
