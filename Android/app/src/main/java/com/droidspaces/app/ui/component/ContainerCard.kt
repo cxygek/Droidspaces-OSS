@@ -52,6 +52,7 @@ data class ContainerCardActions(
     val onUninstall: () -> Unit = {},
     val onMigrate: () -> Unit = {},
     val onResize: () -> Unit = {},
+    val onShrink: () -> Unit = {},
     val onExport: () -> Unit = {},
     val onToggleExpand: () -> Unit = {},
     val onShowLogs: () -> Unit = {},
@@ -320,6 +321,12 @@ fun ContainerCard(
                             label = context.getString(R.string.resize_sparse_image),
                             tint = MaterialTheme.colorScheme.secondary,
                             onClick = actions.onResize
+                        )
+                        ActionItem(
+                            icon = rememberVectorPainter(Icons.Default.Compress),
+                            label = context.getString(R.string.reclaim_sparse_image),
+                            tint = MaterialTheme.colorScheme.secondary,
+                            onClick = actions.onShrink
                         )
                     }
 

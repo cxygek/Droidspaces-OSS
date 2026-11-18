@@ -653,6 +653,17 @@
     <string name="resize_dialog_title">Resize Sparse Image</string>
     <string name="migrate_dialog_message">Migrating \"%1$s\" to a sparse image will create a dedicated ext4 filesystem. This operation is destructive if interrupted. Please backup your data.</string>
     <string name="resize_dialog_message">Resizing the sparse image for \"%1$s\". Increasing size is safer than shrinking. Please backup your data.</string>
+    <string name="reclaim_sparse_image">Reclaim space</string>
+    <string name="reclaim_dialog_title">Reclaim Space</string>
+    <string name="reclaim_dialog_message">Frees the blocks that deleted files left behind. Nothing is deleted, nothing is stopped, and the container keeps its size and contents.</string>
+    <string name="reclaim_measuring">Measuring the image…</string>
+    <string name="reclaim_measure_failed">Could not measure the image.</string>
+    <string name="reclaim_row_capacity">Capacity</string>
+    <string name="reclaim_row_allocated">On disk</string>
+    <string name="reclaim_estimate">About %1$s can be reclaimed.</string>
+    <string name="reclaim_estimate_flat">Nothing to reclaim right now.</string>
+    <string name="reclaim_confirm">Reclaim</string>
+    <string name="reclaim_starting">Reclaiming unused space…</string>
     <string name="starting_migration">Starting migration operation...</string>
     <string name="starting_resizing">Starting resizing operation...</string>
     <string name="help_card_title">New to Droidspaces?</string>

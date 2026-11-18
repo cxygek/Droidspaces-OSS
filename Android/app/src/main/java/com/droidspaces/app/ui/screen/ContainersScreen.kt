@@ -55,6 +55,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.droidspaces.app.ui.viewmodel.SystemStatsViewModel
 import com.droidspaces.app.util.ContainerInfo
+import com.droidspaces.app.util.Constants
 import com.droidspaces.app.util.PreferencesManager
 import com.droidspaces.app.util.FilePickerUtils
 import com.droidspaces.app.ui.component.ContainerCard
@@ -63,6 +64,7 @@ import com.droidspaces.app.ui.component.DialogFooterRow
 import com.droidspaces.app.ui.component.TerminalDialog
 import com.droidspaces.app.ui.component.ExportContainerDialog
 import com.droidspaces.app.util.ValidationUtils
+import com.droidspaces.app.util.ResourceLimits
 import com.droidspaces.app.ui.component.EmptyState
 import com.droidspaces.app.ui.component.ErrorState
 import com.droidspaces.app.ui.component.KernelUnsupportedState
@@ -72,6 +74,7 @@ import com.droidspaces.app.ui.viewmodel.ContainerViewModel
 import com.droidspaces.app.ui.viewmodel.ContainerOperationsViewModel
 import com.droidspaces.app.ui.viewmodel.UninstallState
 import com.droidspaces.app.ui.viewmodel.SparseOp
+import com.droidspaces.app.ui.viewmodel.SparseReclaimPreview
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.clip
 import com.droidspaces.app.R
@@ -105,6 +108,7 @@ fun ContainersScreen(
     // UI-only state (dialog triggers / pending pickers).
     var showUninstallConfirmation by remember { mutableStateOf<ContainerInfo?>(null) }
     var pendingSparseOperation by remember { mutableStateOf<Pair<ContainerInfo, SparseOp>?>(null) }
+    var reclaimTarget by remember { mutableStateOf<ContainerInfo?>(null) }
     var pendingExportContainer by remember { mutableStateOf<ContainerInfo?>(null) }
     var pendingExportEnv by remember { mutableStateOf(false) }
     var askExportEnv by remember { mutableStateOf<ContainerInfo?>(null) }
@@ -245,6 +249,10 @@ fun ContainersScreen(
                                 onResize = {
                                     onExpandedContainerNameChange(null)
                                     pendingSparseOperation = container to SparseOp.RESIZE
+                                },
+                                onShrink = {
+                                    onExpandedContainerNameChange(null)
+                                    reclaimTarget = container
                                 },
                                 onExport = {
                                     onExpandedContainerNameChange(null)
@@ -446,6 +454,24 @@ fun ContainersScreen(
                 onDismiss = { pendingSparseOperation = null }
             )
         }
+
+        // Reclaiming the space deleted files left inside a sparse image
+        reclaimTarget?.let { container ->
+            SparseReclaimDialog(
+                container = container,
+                opsViewModel = opsViewModel,
+                onConfirm = {
+                    reclaimTarget = null
+                    scope.launch {
+                        opsViewModel.executeSparseOperation(
+                            container, SparseOp.RECLAIM, 0,
+                            onRefresh = { containerViewModel.refresh() }
+                        )
+                    }
+                },
+                onDismiss = { reclaimTarget = null }
+            )
+        }
     }
 }
 
@@ -453,6 +479,115 @@ fun ContainersScreen(
 private fun exportFileName(container: ContainerInfo): String {
     val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
     return "${container.name}_${timestamp}.tar.gz"
+}
+
+/**
+ * Gives back the space a sparse image kept after its files were deleted: the
+ * blocks no file uses are trimmed, so the image holds fewer of them on disk and
+ * keeps its size, its capacity and every file. The measurement runs first and
+ * leaves the container as it found it, running or not.
+ */
+@Composable
+private fun SparseReclaimDialog(
+    container: ContainerInfo,
+    opsViewModel: ContainerOperationsViewModel,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var preview by remember { mutableStateOf<SparseReclaimPreview?>(null) }
+    var measuring by remember { mutableStateOf(true) }
+
+    LaunchedEffect(container.name) {
+        preview = opsViewModel.previewSparseReclaim(container)
+        measuring = false
+    }
+
+    val measured = preview
+
+    DsDialog(
+        onDismiss = onDismiss,
+        footer = {
+            DialogFooterRow(
+                dismissLabel = context.getString(R.string.cancel),
+                confirmLabel = context.getString(R.string.reclaim_confirm),
+                onDismiss = onDismiss,
+                onConfirm = onConfirm,
+                // A trim deletes nothing and is cheap, and the estimate is only an
+                // estimate: let it run even when the numbers look flat.
+                confirmEnabled = measured != null
+            )
+        }
+    ) {
+        Text(
+            context.getString(R.string.reclaim_dialog_title),
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.titleLarge
+        )
+        Text(
+            context.getString(R.string.reclaim_dialog_message),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        when {
+            measuring -> Text(
+                context.getString(R.string.reclaim_measuring),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            measured == null -> Text(
+                context.getString(R.string.reclaim_measure_failed),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            else -> {
+                ReclaimRow(
+                    context.getString(R.string.reclaim_row_capacity),
+                    ResourceLimits.formatBytes(measured.imageMb * 1024 * 1024)
+                )
+                ReclaimRow(
+                    context.getString(R.string.reclaim_row_allocated),
+                    ResourceLimits.formatBytes(measured.allocMb * 1024 * 1024)
+                )
+                // The estimate is a floor, not a promise: /data compresses, so a trim
+                // can hand back more than this says. It never claims more than a trim
+                // can find, which is what used to make the button look like a no-op.
+                Text(
+                    if (measured.reclaimMb > 0) {
+                        context.getString(
+                            R.string.reclaim_estimate,
+                            ResourceLimits.formatBytes(measured.reclaimMb * 1024 * 1024)
+                        )
+                    } else {
+                        context.getString(R.string.reclaim_estimate_flat)
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (measured.reclaimMb > 0) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+/** One "label: value" line in the reclaim dialog. */
+@Composable
+private fun ReclaimRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium
+        )
+    }
 }
 
 @Composable

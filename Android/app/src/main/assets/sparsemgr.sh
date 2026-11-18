@@ -100,6 +100,14 @@ _du_h() {
     echo "unknown"
 }
 
+# du actual disk usage in KB, 0 when it cannot be measured
+_du_kb() {
+    local out
+    out=$(du -sk "$1" 2>/dev/null | cut -f1) && [ -n "$out" ] && { echo "$out"; return; }
+    [ -n "$BB" ] && out=$("$BB" du -sk "$1" 2>/dev/null | cut -f1) && [ -n "$out" ] && { echo "$out"; return; }
+    echo "0"
+}
+
 # portable sync + sleep
 _sync()  { sync 2>/dev/null || { [ -n "$BB" ] && "$BB" sync 2>/dev/null; } || true; }
 _sleep() { sleep "$1" 2>/dev/null || { [ -n "$BB" ] && "$BB" sleep "$1" 2>/dev/null; } || true; }
@@ -197,6 +205,20 @@ check_resize_requirements() {
     log "All resize requirements met"
 }
 
+check_reclaim_requirements() {
+    log "Checking tools for reclaim..."
+    local fail=0
+
+    command -v tune2fs >/dev/null 2>&1 || { error "tune2fs not found";  fail=1; }
+    command -v losetup >/dev/null 2>&1 || { error "losetup not found";  fail=1; }
+    if [ -z "$BB" ] && ! command -v fstrim >/dev/null 2>&1; then
+        error "neither busybox nor fstrim is available"
+        fail=1
+    fi
+
+    [ "$fail" -ne 0 ] && { error "Reclaim cannot run on this device"; exit 1; }
+}
+
 # migrate: cleanup on error
 _migrate_cleanup() {
     warn "Error during migration - cleaning up temp files..."
@@ -222,8 +244,8 @@ cmd_migrate() {
         echo "Example: $SCRIPT_NAME -d /path/to/dir migrate 16"
         exit 1
     fi
-    if [ "$size_gb" -lt 4 ] || [ "$size_gb" -gt 512 ]; then
-        error "Size must be between 4 and 512 GB (got: ${size_gb}GB)"
+    if [ "$size_gb" -lt 1 ] || [ "$size_gb" -gt 512 ]; then
+        error "Size must be between 1 and 512 GB (got: ${size_gb}GB)"
         exit 1
     fi
 
@@ -255,6 +277,19 @@ cmd_migrate() {
     fi
 
     check_migrate_requirements
+
+    # A size that cannot hold what is about to be copied used to fail halfway
+    # through the tar, after the image was formatted. Now that the floor is 1GB,
+    # check it first: the copy needs the source's disk usage plus room for ext4
+    # metadata, so 90% of the image is the budget. Failing here costs nothing.
+    local src_kb budget_kb
+    src_kb=$(_du_kb "$ROOTFS_DIR")
+    budget_kb=$(_awk -v g="$size_gb" 'BEGIN{printf "%d", g*1024*1024*90/100}')
+    if [ "$src_kb" -gt 0 ] && [ "$src_kb" -gt "$budget_kb" ]; then
+        error "Rootfs needs about $(( src_kb / 1024 )) MB but ${size_gb}GB leaves only $(( budget_kb / 1024 )) MB"
+        error "Pick a larger size, or clean up the rootfs first"
+        exit 1
+    fi
 
     log " Migration: directory -> sparse image"
     log "   Source  : $ROOTFS_DIR"
@@ -349,8 +384,8 @@ cmd_resize() {
         error "Invalid size: '$new_size_gb' - must be a positive integer"
         exit 1
     fi
-    if [ "$new_size_gb" -lt 4 ] || [ "$new_size_gb" -gt 512 ]; then
-        error "Size must be between 4 and 512 GB"
+    if [ "$new_size_gb" -lt 1 ] || [ "$new_size_gb" -gt 512 ]; then
+        error "Size must be between 1 and 512 GB"
         exit 1
     fi
     if [ ! -f "$RESIZE_IMG" ]; then
@@ -466,25 +501,343 @@ cmd_resize() {
 }
 
 
+# reclaim helpers. Every size here is a byte count of an image that can reach
+# hundreds of GB, and the device shell's arithmetic is 32-bit: an 8 GB image is
+# 2^33 bytes, which wraps to 0 and once made every container look minimal. So
+# no byte count is ever arithmetic'd by the shell itself.
+_awk() {
+    if command -v awk >/dev/null 2>&1; then
+        awk "$@"
+    elif [ -n "$BB" ]; then
+        "$BB" awk "$@"
+    fi
+}
+
+# MB of a byte count
+_bytes_mb() { _awk -v b="${1:-0}" 'BEGIN{printf "%d", b/1048576}'; }
+
+# KB the image really occupies on the host. Sparse holes and f2fs compression
+# both keep it below the file's size, and this is the number reclaim has to
+# move: it is what a file manager shows.
+_alloc_kb() {
+    local b
+    b=$(stat -c %b "$1" 2>/dev/null)
+    if [ -z "$b" ] && [ -n "$BB" ]; then
+        b=$("$BB" stat -c %b "$1" 2>/dev/null)
+    fi
+    [ -n "$b" ] || { echo 0; return; }
+    _awk -v b="$b" 'BEGIN{printf "%d", b/2}'
+}
+
+# KB the filesystem counts as used, read from the on-disk superblock. Only valid
+# for a stopped container: a mounted ext4 keeps its accounting in memory and
+# writes the superblock back on checkpoint or unmount, so this trails whatever
+# the journal has not flushed yet. Use _fs_used_kb_running for a live one.
+_fs_used_kb() {
+    local info count free bs
+    info=$(tune2fs -l "$1" 2>/dev/null)
+    count=$(printf '%s\n' "$info" | sed -n 's/^Block count: *\([0-9][0-9]*\).*/\1/p' | head -1)
+    free=$(printf '%s\n' "$info" | sed -n 's/^Free blocks: *\([0-9][0-9]*\).*/\1/p' | head -1)
+    bs=$(printf '%s\n' "$info" | sed -n 's/^Block size: *\([0-9][0-9]*\).*/\1/p' | head -1)
+    [ -n "$count" ] && [ -n "$free" ] && [ -n "$bs" ] || return 1
+    _awk -v c="$count" -v f="$free" -v b="$bs" 'BEGIN{printf "%d", (c-f)*b/1024}'
+}
+
+# KB the filesystem is worth in total (blocks x block size). Static: only a
+# resize changes it, so reading the superblock offline is exact even while the
+# container is running.
+_fs_total_kb() {
+    local info count bs
+    info=$(tune2fs -l "$1" 2>/dev/null)
+    count=$(printf '%s\n' "$info" | sed -n 's/^Block count: *\([0-9][0-9]*\).*/\1/p' | head -1)
+    bs=$(printf '%s\n' "$info" | sed -n 's/^Block size: *\([0-9][0-9]*\).*/\1/p' | head -1)
+    [ -n "$count" ] && [ -n "$bs" ] || return 1
+    _awk -v c="$count" -v b="$bs" 'BEGIN{printf "%d", c*b/1024}'
+}
+
+# KB a running container's root filesystem really holds, metadata included. It is
+# asked inside the container with df, because the on-disk superblock of a mounted
+# ext4 only catches up on checkpoint or unmount.
+#
+# df's own "used" is not that number: ext4 reports only the usable blocks, leaving
+# out what it spends on itself (journal, block and inode bitmaps, group
+# descriptors). On a 16 GB image that gap is several hundred MB, and subtracting
+# it from the host allocation made every preview promise space a trim could not
+# find. So: total from the superblock, free from df, and the difference is what
+# the image actually holds.
+_fs_used_kb_running() {
+    local name="$1" img="$2" bin out total used total_kb
+    bin=$(_droidspaces_bin) || return 1
+    out=$("$bin" -n "$name" run -- df -kP / 2>/dev/null | tail -1)
+    total=$(printf '%s\n' "$out" | _awk 'NF >= 3 {print $2}')
+    used=$(printf '%s\n' "$out" | _awk 'NF >= 3 {print $3}')
+    case "$total$used" in
+        "" | *[!0-9]*) return 1 ;;
+    esac
+    total_kb=$(_fs_total_kb "$img") || return 1
+    _awk -v t="$total_kb" -v total="$total" -v used="$used" 'BEGIN{printf "%d", t-(total-used)}'
+}
+
+# The droidspaces binary that owns this install, or nothing.
+_droidspaces_bin() {
+    local bin="${DROIDSPACES_BIN:-}"
+    if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+        bin="/data/local/Droidspaces/bin/droidspaces"
+    fi
+    [ -x "$bin" ] || bin=$(command -v droidspaces 2>/dev/null)
+    [ -n "$bin" ] && [ -x "$bin" ] || return 1
+    echo "$bin"
+}
+
+# The init pid of a running container, nothing when it is not running.
+_container_pid() {
+    local pidfile="/data/local/Droidspaces/Pids/$1.pid" pid
+    [ -f "$pidfile" ] || return 1
+    pid=$(cat "$pidfile" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+# The loop device an image is attached to, nothing when none is.
+_loop_for_image() {
+    losetup -a 2>/dev/null | grep -F "$1" | head -1 | cut -d: -f1
+}
+
+# fstrim one mounted path, with busybox when the system has none.
+_fstrim_path() {
+    if [ -n "$BB" ]; then
+        "$BB" fstrim -v "$1" 2>&1
+    else
+        fstrim -v "$1" 2>&1
+    fi
+}
+
+# Trim a running container from here, through /proc/<pid>/root. That path
+# resolves to the container's root mount, so FITRIM reaches its ext4 on the loop
+# device and every discard comes back as a hole in the image file. Nothing
+# inside the container takes part, which also covers the distros whose busybox
+# ships the fstrim symlink without the applet.
+_trim_live() {
+    local name="$1" pid out
+    pid=$(_container_pid "$name")
+    if [ -n "$pid" ]; then
+        out=$(_fstrim_path "/proc/$pid/root")
+        case "$out" in
+            *trimmed*)
+                printf '%s\n' "$out" | grep -i trimmed | tail -1
+                return 0 ;;
+        esac
+    fi
+    # A root that is an overlay rather than the image itself has nothing to
+    # trim, but the container's own fstrim can still reach whatever it mounted.
+    _trim_in_container "$name"
+}
+
+# Trim from inside the running container, as a fallback for that case.
+_trim_in_container() {
+    local name="$1" bin out
+    if ! bin=$(_droidspaces_bin); then
+        error "droidspaces binary not found"
+        return 1
+    fi
+    out=$("$bin" -n "$name" run -- sh -c \
+        'if command -v fstrim >/dev/null 2>&1; then fstrim -v /; else busybox fstrim -v /; fi' 2>&1)
+    case "$out" in
+        *trimmed*)
+            printf '%s\n' "$out" | grep -i trimmed | tail -1
+            return 0 ;;
+        *)
+            printf '%s\n' "$out" | tail -3
+            return 1 ;;
+    esac
+}
+
+# Trim with the image mounted here, for a stopped container whose fstrim is out
+# of reach. The discards land in the backing file exactly the same way.
+_trim_offline() {
+    local img="$1" mnt out rc
+    mnt="$(dirname "$img")/.reclaim_$$"
+    _mkdir "$mnt" || { error "Could not create $mnt"; return 1; }
+    if ! _mount -t ext4 -o loop,rw "$img" "$mnt"; then
+        _rm -rf "$mnt"
+        return 1
+    fi
+    out=$(_fstrim_path "$mnt")
+    rc=$?
+    _sync
+    _umount "$mnt" 2>/dev/null
+    _rm -rf "$mnt"
+    if [ "$rc" -ne 0 ]; then
+        printf '%s\n' "$out" | tail -3
+        return 1
+    fi
+    printf '%s\n' "$out" | tail -1
+    return 0
+}
+
+
+# CMD: reclaim
+#
+# Deleting files inside a container frees blocks inside the ext4 image, not on
+# the host: the image keeps every block it ever allocated, so a container that
+# once held 3 GB of downloads goes on paying for them after they are gone. A
+# trim releases the blocks no file uses, and the loop device turns each discard
+# into a hole in the backing file. The image keeps its size, its capacity and
+# every file in it; it only stops occupying space it does not need.
+cmd_reclaim() {
+    local name="$CONTAINER_NAME" pid="" loop="" running=0
+    local alloc_kb used_kb image_mb alloc_mb used_mb reclaim_kb reclaim_mb
+    local trim_out="" trim_rc=0
+
+    [ -f "$RESIZE_IMG" ] || {
+        error "Sparse image not found: $RESIZE_IMG"
+        exit 1
+    }
+    check_reclaim_requirements
+
+    if [ -n "$name" ]; then
+        pid=$(_container_pid "$name")
+        [ -n "$pid" ] && running=1
+    fi
+
+    # A live image belongs to its container, and trimming it from here would be
+    # guessing at a filesystem somebody else is mounting. Only the container's
+    # own namespace can trim that one.
+    loop=$(_loop_for_image "$RESIZE_IMG")
+    if [ -n "$loop" ] && [ "$running" -eq 0 ]; then
+        error "The image is attached to $loop, so a container is using it"
+        error "Pass -c <container> so the trim runs where the image is mounted"
+        exit 1
+    fi
+
+    alloc_kb=$(_alloc_kb "$RESIZE_IMG")
+    used_kb=""
+    # The on-disk superblock is stale while the filesystem is mounted, so a live
+    # container is asked directly. A stopped one has nothing to be stale about.
+    if [ "$running" -eq 1 ]; then
+        used_kb=$(_fs_used_kb_running "$name" "$RESIZE_IMG")
+    fi
+    if [ -z "$used_kb" ]; then
+        if ! used_kb=$(_fs_used_kb "$RESIZE_IMG"); then
+            error "Could not read the filesystem - is this an ext2/3/4 image?"
+            exit 1
+        fi
+    fi
+    image_mb=$(_bytes_mb "$(_stat_size "$RESIZE_IMG")")
+    alloc_mb=$(( alloc_kb / 1024 ))
+    used_mb=$(( used_kb / 1024 ))
+
+    # A floor, not a promise: the host can hold less than the filesystem uses
+    # (f2fs compresses under /data), and it never holds less than the blocks the
+    # filesystem calls free and has already discarded. Under-reporting is the
+    # safe direction; the run below reports what actually came back.
+    reclaim_kb=$(( alloc_kb - used_kb ))
+    [ "$reclaim_kb" -lt 0 ] && reclaim_kb=0
+    reclaim_mb=$(( reclaim_kb / 1024 ))
+
+    if [ "$running" -eq 1 ]; then
+        log "Container '$name' is running - trimming it live"
+    else
+        log "Container is stopped - mounting the image to trim it"
+    fi
+    log "   Capacity      : ${image_mb} MB (this does not change)"
+    log "   Allocated     : ${alloc_mb} MB"
+    log "   In use        : ${used_mb} MB (metadata included)"
+    log "   Reclaimable   : ${reclaim_mb} MB (estimate)"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        # The app reads these lines and shows the preview from them (IMAGE_MB and
+        # ALLOC_MB for the two rows, RECLAIM_MB for the estimate; USED_MB is for a
+        # log). A real run prints the result instead, so no key ever arrives twice.
+        echo "IMAGE_MB=${image_mb}"
+        echo "ALLOC_MB=${alloc_mb}"
+        echo "USED_MB=${used_mb}"
+        echo "RECLAIM_MB=${reclaim_mb}"
+        log "Dry run: nothing was changed"
+        exit 0
+    fi
+
+    if [ "$YES_FLAG" -eq 0 ]; then
+        warn "Trimming releases blocks no file uses. Nothing is deleted, and the"
+        warn "image keeps its size, its capacity and everything in it."
+        printf "  Type 'YES' to confirm: "
+        read -r _confirm
+        [ "$_confirm" != "YES" ] && { log "Reclaim cancelled"; exit 0; }
+    fi
+
+    if [ "$running" -eq 1 ]; then
+        log "[1/2] Trimming '$name'..."
+        trim_out=$(_trim_live "$name")
+        trim_rc=$?
+    else
+        log "[1/2] Trimming the mounted image..."
+        trim_out=$(_trim_offline "$RESIZE_IMG")
+        trim_rc=$?
+    fi
+    [ -n "$trim_out" ] && log "    $trim_out"
+    if [ "$trim_rc" -ne 0 ]; then
+        error "The trim did not complete - the image was left as it was"
+        error "A loop or host filesystem without discard support looks like this"
+        exit 1
+    fi
+    _sync; _sleep 1
+
+    # The host is the only witness that matters: the file either has fewer
+    # blocks on disk now or it has not, whatever the trim reported.
+    log "[2/2] Measuring the result..."
+    local new_alloc_kb new_alloc_mb freed_kb freed_mb
+    new_alloc_kb=$(_alloc_kb "$RESIZE_IMG")
+    freed_kb=$(( alloc_kb - new_alloc_kb ))
+    [ "$freed_kb" -lt 0 ] && freed_kb=0
+    new_alloc_mb=$(( new_alloc_kb / 1024 ))
+    freed_mb=$(( freed_kb / 1024 ))
+
+    echo "IMAGE_MB=${image_mb}"
+    echo "FREED_MB=${freed_mb}"
+
+    log ""
+    if [ "$freed_kb" -le 0 ]; then
+        log "Nothing came back: the image already occupies only what it uses"
+    elif [ "$freed_mb" -le 0 ]; then
+        log "Under 1 MB came back - the image was already as tight as it gets"
+    else
+        log "Reclaim complete!"
+        log "   Allocated ${alloc_mb} MB -> ${new_alloc_mb} MB (freed ${freed_mb} MB)"
+        log "   Capacity stays ${image_mb} MB"
+    fi
+    log "   Image: $RESIZE_IMG"
+}
+
+
 # Usage
 
 usage() {
     echo "Usage:"
     echo "  $SCRIPT_NAME -d <base_dir> migrate <size_gb>"
     echo "  $SCRIPT_NAME -i <image>    resize  <size_gb>"
+    echo "  $SCRIPT_NAME -i <image>    reclaim [-c <container>]"
     echo ""
     echo "Options:"
     echo "  -d, --dir <path>      Base directory containing rootfs/ (for migrate)"
     echo "                        Derives rootfs/ and rootfs.img from this path"
-    echo "  -i, --image <file>    Path to an existing sparse image (for resize)"
+    echo "  -i, --image <file>    Path to an existing sparse image (resize, reclaim)"
+    echo "  -c, --container <name>"
+    echo "                        The container that owns the image (reclaim). A running"
+    echo "                        one is trimmed live; a stopped one is mounted here."
     echo "  -y, --yes             Skip confirmation prompts"
+    echo "      --dry-run         Report what could be freed, change nothing (reclaim)"
     echo "  -h, --help            Show this help and exit"
     echo ""
     echo "Commands:"
     echo "  migrate <size_gb>     Migrate directory-based rootfs/ to a sparse ext4 image"
-    echo "                        size: 4-512 GB"
+    echo "                        size: 1-512 GB"
     echo "  resize  <size_gb>     Resize an existing sparse image"
-    echo "                        size: 4-512 GB"
+    echo "                        size: 1-512 GB"
+    echo "  reclaim               Give back the space deleted files left behind:"
+    echo "                        unused blocks are trimmed, the loop device turns each"
+    echo "                        discard into a hole in the image, and the file takes"
+    echo "                        less room on disk. Size, capacity and contents stay."
     echo ""
     echo "BusyBox:"
     echo "  Default path  : /data/local/Droidspaces/bin/busybox"
@@ -499,12 +852,15 @@ usage() {
     echo "  $SCRIPT_NAME -d /data/local/ubuntu migrate 16"
     echo "  $SCRIPT_NAME -i /data/local/ubuntu/rootfs.img resize 32"
     echo "  $SCRIPT_NAME -i /data/local/ubuntu/rootfs.img resize 8 --yes"
+    echo "  $SCRIPT_NAME -i /data/local/ubuntu/rootfs.img reclaim --dry-run"
+    echo "  $SCRIPT_NAME -i /data/local/ubuntu/rootfs.img -c ubuntu reclaim --yes"
     echo ""
     echo "Notes:"
-    echo "  - Unmount the image/rootfs before running either command."
-    echo "  - Always back up before resizing."
+    echo "  - Unmount the image/rootfs before resizing."
+    echo "  - reclaim is safe on a running container; it deletes nothing."
     echo "  - migrate requires: mkfs.ext4 (or mke2fs), tar"
     echo "  - resize  requires: e2fsck, resize2fs"
+    echo "  - reclaim requires: tune2fs, losetup, fstrim (busybox has one)"
     exit "${1:-0}"
 }
 
@@ -513,9 +869,11 @@ usage() {
 
 BASE_DIR=""
 RESIZE_IMG=""
+CONTAINER_NAME=""
 COMMAND=""
 CMD_ARG=""
 YES_FLAG=0
+DRY_RUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -527,9 +885,14 @@ while [ $# -gt 0 ]; do
             RESIZE_IMG="$2"; shift 2 ;;
         -y|--yes)
             YES_FLAG=1; shift ;;
+        -c|--container)
+            [ -z "$2" ] && { error "--container requires a name argument"; exit 1; }
+            CONTAINER_NAME="$2"; shift 2 ;;
+        --dry-run)
+            DRY_RUN=1; shift ;;
         -h|--help)
             usage 0 ;;
-        migrate|resize)
+        migrate|resize|reclaim)
             COMMAND="$1"
             shift
             # Grab the size argument (next positional, if not a flag)
@@ -573,9 +936,16 @@ case "$COMMAND" in
             usage 1
         fi
         ;;
+    reclaim)
+        if [ -z "$RESIZE_IMG" ]; then
+            error "reclaim requires -i <image>"
+            usage 1
+        fi
+        ;;
 esac
 
-if [ -z "$CMD_ARG" ]; then
+# reclaim takes no size, so only the two size commands insist on one.
+if [ -z "$CMD_ARG" ] && [ "$COMMAND" != "reclaim" ]; then
     error "Size argument required (e.g. '$SCRIPT_NAME ... $COMMAND 16')"
     usage 1
 fi
@@ -606,4 +976,5 @@ fi
 case "$COMMAND" in
     migrate) cmd_migrate "$CMD_ARG" ;;
     resize)  cmd_resize  "$CMD_ARG" ;;
+    reclaim) cmd_reclaim ;;
 esac

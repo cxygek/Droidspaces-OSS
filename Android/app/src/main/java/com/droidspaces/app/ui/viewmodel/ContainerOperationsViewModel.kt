@@ -23,6 +23,7 @@ import com.droidspaces.app.util.FilePickerUtils
 import com.droidspaces.app.util.PreferencesManager
 import com.droidspaces.app.util.SystemInfoManager
 import com.droidspaces.app.util.ViewModelLogger
+import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -35,7 +36,21 @@ sealed class UninstallState {
 }
 
 /** A sparse-image operation awaiting a size from the user. */
-enum class SparseOp { MIGRATE, RESIZE }
+enum class SparseOp { MIGRATE, RESIZE, RECLAIM }
+
+/**
+ * What sparsemgr's dry run says a reclaim would free. Every value is MB.
+ *
+ * [allocMb] is what the image file occupies on disk. [reclaimMb] is a floor, not
+ * a promise: it excludes the blocks the filesystem spends on itself, so it never
+ * claims space a trim cannot find, but /data compresses and a trim can hand back
+ * more than this says.
+ */
+data class SparseReclaimPreview(
+    val imageMb: Long,
+    val allocMb: Long,
+    val reclaimMb: Long,
+)
 
 /**
  * Owns the container lifecycle/maintenance operations (start/stop/restart,
@@ -291,7 +306,51 @@ class ContainerOperationsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ── Sparse migrate / resize ─────────────────────────────────────────────────
+    // ── Sparse migrate / resize / reclaim ───────────────────────────────────────
+    /**
+     * Ask sparsemgr what a reclaim would free, changing nothing. The container is
+     * left exactly as it is: a trim reads the filesystem's free blocks and does
+     * not touch a byte of data, so a running container is measured where it runs.
+     */
+    suspend fun previewSparseReclaim(container: ContainerInfo): SparseReclaimPreview? {
+        val logs = logsFor(container.name)
+        val logger = ViewModelLogger { level, message -> logs.add(level to message) }
+        var scriptFile: File? = null
+        return try {
+            uninstallState = UninstallState.Idle
+
+            val rootfsPath = ContainerManager.readRootfsPath(container.name) ?: return null
+            if (rootfsPath.substringAfterLast('/') != "rootfs.img") return null
+
+            val deployed = ContainerInstaller.deployAsset(appContext, "sparsemgr.sh")
+            scriptFile = deployed
+            val script = ContainerCommandBuilder.quote(deployed.absolutePath)
+            val image = ContainerCommandBuilder.quote(rootfsPath)
+            val name = ContainerCommandBuilder.quote(container.name)
+            val result = withContext(Dispatchers.IO) {
+                Shell.cmd("$script -i $image -c $name reclaim --dry-run 2>&1").exec()
+            }
+
+            fun value(name: String): Long? = result.out
+                .firstOrNull { it.startsWith("$name=") }
+                ?.substringAfter('=')
+                ?.trim()
+                ?.toLongOrNull()
+
+            val imageMb = value("IMAGE_MB") ?: return null
+            SparseReclaimPreview(
+                imageMb = imageMb,
+                allocMb = value("ALLOC_MB") ?: 0,
+                reclaimMb = value("RECLAIM_MB") ?: 0,
+            )
+        } catch (e: Exception) {
+            logger.e("Error measuring the image: ${e.message}")
+            null
+        } finally {
+            scriptFile?.delete()
+        }
+    }
+
     suspend fun executeSparseOperation(
         container: ContainerInfo,
         op: SparseOp,
@@ -307,7 +366,9 @@ class ContainerOperationsViewModel(app: Application) : AndroidViewModel(app) {
 
         var scriptFile: File? = null
         try {
-            if (!stopIfRunning(container, logger)) return
+            // A trim runs against the live filesystem and stops nothing; migrate and
+            // resize rewrite the image, and cannot touch one a container has open.
+            if (op != SparseOp.RECLAIM && !stopIfRunning(container, logger)) return
             uninstallState = UninstallState.Idle
 
             logs.clear()
@@ -347,6 +408,18 @@ class ContainerOperationsViewModel(app: Application) : AndroidViewModel(app) {
                     logger.i(string(R.string.starting_resizing))
                     "$qScript -i ${ContainerCommandBuilder.quote(rootfsPath)} resize $sizeGb --yes"
                 }
+                SparseOp.RECLAIM -> {
+                    if (rootfsPath.substringAfterLast('/') != "rootfs.img") {
+                        logger.e("Rootfs at $rootfsPath is not a sparse image; cannot reclaim space.")
+                        return
+                    }
+                    logger.i(string(R.string.reclaim_starting))
+                    // The container name tells sparsemgr whether the image is live:
+                    // a running container is trimmed from inside, a stopped one is
+                    // mounted here. Neither path deletes or resizes anything.
+                    "$qScript -i ${ContainerCommandBuilder.quote(rootfsPath)} " +
+                        "-c ${ContainerCommandBuilder.quote(container.name)} reclaim --yes"
+                }
             }
 
             val success = ContainerOperationExecutor.executeCommand(
@@ -357,17 +430,21 @@ class ContainerOperationsViewModel(app: Application) : AndroidViewModel(app) {
                 operationCompletedMessage = string(R.string.operation_completed_success)
             )
 
-            if (success) {
+            // A trim keeps the file and its capacity exactly as the config
+            // describes them; there is nothing to write back.
+            if (success && op == SparseOp.RECLAIM) {
+                onRefresh()
+            } else if (success) {
                 logger.i("Updating container configuration...")
-                val updatedConfig = if (op == SparseOp.MIGRATE) {
-                    container.copy(
+                val updatedConfig = when (op) {
+                    SparseOp.MIGRATE -> container.copy(
                         useSparseImage = true,
                         sparseImageSizeGB = sizeGb,
                         // sparsemgr writes the image beside the rootfs it replaced.
                         rootfsPath = "$rootfsParent/rootfs.img"
                     )
-                } else {
-                    container.copy(sparseImageSizeGB = sizeGb)
+                    SparseOp.RESIZE -> container.copy(sparseImageSizeGB = sizeGb)
+                    SparseOp.RECLAIM -> container
                 }
                 val configResult = withContext(Dispatchers.IO) {
                     ContainerManager.updateContainerConfig(appContext, container.name, updatedConfig)

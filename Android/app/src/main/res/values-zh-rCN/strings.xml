@@ -158,6 +158,17 @@
     <string name="select_user_to_enter">选择以该用户身份进入容器：</string>
     <string name="sparse_images_recommended">建议在加密存储、F2FS /data 分区或其他可能与直接目录挂载存在兼容性问题的文件系统上运行容器时，使用稀疏镜像。</string>
     <string name="requirements_check_completed_successfully">成功完成运行要求检查</string>
+    <string name="reclaim_sparse_image">回收空间</string>
+    <string name="reclaim_dialog_title">回收空间</string>
+    <string name="reclaim_dialog_message">释放已删除文件留下的块。不会删除文件、不会停止容器，容量与内容都不变。</string>
+    <string name="reclaim_measuring">正在测量镜像…</string>
+    <string name="reclaim_measure_failed">无法测量该镜像。</string>
+    <string name="reclaim_row_capacity">容量</string>
+    <string name="reclaim_row_allocated">实际占用</string>
+    <string name="reclaim_estimate">约可回收 %1$s。</string>
+    <string name="reclaim_estimate_flat">当前没有可回收的空间。</string>
+    <string name="reclaim_confirm">回收</string>
+    <string name="reclaim_starting">正在回收未使用空间…</string>
     <string name="starting_migration">开始执行迁移操作…</string>
     <string name="container_name_placeholder" translatable="false">my-container</string>
     <string name="reboot_recommended">建议重启以应用 SELinux 策略并在开机时启动守护进程。</string>
