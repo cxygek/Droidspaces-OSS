@@ -93,11 +93,15 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
     }
 
     LaunchedEffect(Unit) {
-        // The kernel forgets iptables rules on reboot; the file does not.
-        HostNetworkManager.applyAll()
+        // Read first, repair second. The card can show the lease, the rules and
+        // their real state from two cheap reads; re-installing rules or running
+        // a command inside the gateway is only worth doing once one of those
+        // reads says something is off, and both steps check before they touch
+        // anything.
         refresh()
-        // A container that came back after the phone rebooted also came back
-        // without the route that makes forwarded connections answerable.
+        if (HostNetworkManager.applyAll()) refresh()
+        // A container that came back after a reboot also came back without the
+        // route that makes forwarded connections answerable.
         HostNetworkManager.syncGatewayRoute(status, running)
     }
 

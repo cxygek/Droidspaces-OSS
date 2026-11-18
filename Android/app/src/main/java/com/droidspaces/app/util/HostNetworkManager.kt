@@ -64,6 +64,7 @@ data class RunningContainer(
     val name: String,
     val ip: String,
     val addresses: List<String> = emptyList(),
+    val pid: Int = 0,
 ) {
     fun holds(address: String): Boolean =
         addresses.isEmpty() || address in addresses
@@ -115,6 +116,7 @@ object HostNetworkManager {
     private const val TAG = "dspaces:net"
     private const val FORWARDS_PATH = "${Constants.WORKSPACE_PATH}/Net/forwards.conf"
     private const val SWITCH_PATH = "${Constants.WORKSPACE_PATH}/Net/forwarding.conf"
+    private const val ROUTE_PATH = "${Constants.WORKSPACE_PATH}/Net/route.conf"
 
     /** What the last operations did, for the log viewer. */
     val logs = mutableStateListOf<Pair<Int, String>>()
@@ -240,7 +242,11 @@ object HostNetworkManager {
         if (!st.hasAddress || st.gateway.isBlank() || st.gateway == "0.0.0.0")
             return@runCatching false
 
-        val gateway = containers.firstOrNull { it.ip == st.gateway }
+        // Match on every address the container holds: the preferred one is the
+        // LAN address only when the caller knew the LAN prefix, and the gateway
+        // is also the container that owns the bridge's NAT side.
+        val gateway = containers.firstOrNull { it.addresses.contains(st.gateway) }
+            ?: containers.firstOrNull { it.ip == st.gateway }
         if (gateway == null) {
             warn("No container holds ${st.gateway}; the return route is not in place.")
             return@runCatching false
@@ -266,6 +272,16 @@ object HostNetworkManager {
             ?: return@runCatching false
         val subnet = networkCidr(cidr) ?: return@runCatching false
 
+        /* What we last told this gateway. Running a command inside a container
+         * costs the better part of a second, and the answer only changes when
+         * the gateway restarts (new pid), the phone gets a new LAN address, or
+         * the uplink moves to another subnet. */
+        val record = "gw=${gateway.name} pid=${gateway.pid} via=${st.ip} subnet=$subnet"
+        if (readRootFile(ROUTE_PATH).any { it.trim() == record }) {
+            info("${gateway.name}: $subnet via ${st.ip} already in place.")
+            return@runCatching false
+        }
+
         val command = "${Constants.DROIDSPACES_BINARY_PATH} -n " +
             "${ContainerCommandBuilder.quote(gateway.name)} run -- " +
             "ip route replace $subnet via ${st.ip}"
@@ -273,6 +289,7 @@ object HostNetworkManager {
             fail("Could not point ${gateway.name} at $subnet via ${st.ip}.")
             return@runCatching false
         }
+        writeRootFile(ROUTE_PATH, record)
         info("${gateway.name}: $subnet via ${st.ip}")
         true
     }.getOrDefault(false)
@@ -310,7 +327,8 @@ object HostNetworkManager {
                 lanPrefix == null -> addrs.firstOrNull().orEmpty()
                 else -> addrs.firstOrNull { it.startsWith(lanPrefix) } ?: addrs.firstOrNull().orEmpty()
             }
-            if (name.isEmpty()) null else RunningContainer(name, ip, addrs)
+            if (name.isEmpty()) null
+            else RunningContainer(name, ip, addrs, o.optInt("pid"))
         }
     }
 
@@ -365,35 +383,45 @@ object HostNetworkManager {
      * list: a rule that survived a reboot of the phone or a restart of the
      * container looks identical in the file, and only the chains know.
      */
-    suspend fun forwardStates(
-        rules: List<HostForward>,
-        containers: List<RunningContainer>,
-    ): List<ForwardStatus> {
-        if (rules.isEmpty()) return emptyList()
+    /** Our rules as they exist right now, in one shell call. */
+    private suspend fun chainLines(): Pair<List<String>, List<String>> {
         val wait = waitFlag()
         val dump = shOut(
             "iptables $wait -t nat -S $CHAIN_NAT 2>/dev/null; echo @@; " +
                 "iptables $wait -S $CHAIN_FWD 2>/dev/null"
         )
         val split = dump.indexOf("@@")
-        val nat = if (split >= 0) dump.subList(0, split) else dump
-        val forward = if (split >= 0) dump.drop(split + 1) else emptyList()
+        val nat = (if (split >= 0) dump.subList(0, split) else dump).filter { it.contains(TAG) }
+        val forward = (if (split >= 0) dump.drop(split + 1) else emptyList())
+            .filter { it.contains(TAG) }
+        return nat to forward
+    }
 
+    private fun hasRedirect(nat: List<String>, rule: HostForward): Boolean = nat.any { line ->
+        line.contains("-p ${rule.proto}") &&
+            line.contains("--dport ${rule.hostPort} ") &&
+            line.contains("--to-destination ${rule.containerIp}:${rule.containerPort}")
+    }
+
+    private fun hasAccept(forward: List<String>, rule: HostForward): Boolean = forward.any { line ->
+        line.contains("-d ${rule.containerIp}") &&
+            line.contains("--dport ${rule.containerPort} ") &&
+            line.contains("-j ACCEPT")
+    }
+
+    suspend fun forwardStates(
+        rules: List<HostForward>,
+        containers: List<RunningContainer>,
+    ): List<ForwardStatus> {
+        if (rules.isEmpty()) return emptyList()
+        val (nat, forward) = chainLines()
         return rules.map { rule ->
             val live = containers.firstOrNull { it.name == rule.container }
             val state = when {
                 live == null -> ForwardState.STOPPED
                 !live.holds(rule.containerIp) && live.sameSubnet(rule.containerIp) ->
                     ForwardState.DRIFTED
-                nat.any { line ->
-                    line.contains("-p ${rule.proto}") &&
-                        line.contains("--dport ${rule.hostPort} ") &&
-                        line.contains("--to-destination ${rule.containerIp}:${rule.containerPort}")
-                } && forward.any { line ->
-                    line.contains("-d ${rule.containerIp}") &&
-                        line.contains("--dport ${rule.containerPort} ") &&
-                        line.contains("-j ACCEPT")
-                } -> ForwardState.ACTIVE
+                hasRedirect(nat, rule) && hasAccept(forward, rule) -> ForwardState.ACTIVE
                 else -> ForwardState.INACTIVE
             }
             ForwardStatus(rule, state)
@@ -433,12 +461,17 @@ object HostNetworkManager {
      * stay in the kernel for good. Rules whose container came back on a new
      * address are rewritten before they are installed.
      */
-    suspend fun applyAll() = runCatching {
+    suspend fun applyAll(): Boolean = runCatching {
         if (!forwardingEnabled()) {
+            val (nat, forward) = chainLines()
+            if (nat.isEmpty() && forward.isEmpty()) {
+                info("Forwarding is off; no rules in the kernel.")
+                return@runCatching false
+            }
             ensureChains()
             flushChains()
-            info("Forwarding is off; rules are not applied.")
-            return@runCatching
+            info("Forwarding is off; rules removed from the kernel.")
+            return@runCatching true
         }
 
         val containers = runningContainers(null)
@@ -456,13 +489,26 @@ object HostNetworkManager {
         }
         if (followed != saved) writeForwards(followed)
 
+        /* Read before writing: on a phone that has not rebooted the kernel
+         * already matches the file, and re-installing is a dozen root shells
+         * the user would wait through every time the tab opens. */
+        val (nat, forward) = chainLines()
+        val upToDate = followed.all { hasRedirect(nat, it) && hasAccept(forward, it) } &&
+            nat.size == followed.size && forward.size == followed.size
+        if (upToDate) {
+            if (followed.isNotEmpty())
+                info("${followed.size} rule${if (followed.size == 1) "" else "s"} already applied.")
+            return@runCatching false
+        }
+
         ensureChains()
         flushChains()
-        if (followed.isEmpty()) return@runCatching
+        if (followed.isEmpty()) return@runCatching true
         val subnet = status()?.subnet
         followed.forEach { install(it, subnet) }
         info("${followed.size} rule${if (followed.size == 1) "" else "s"} applied.")
-    }
+        true
+    }.getOrDefault(false)
 
     private suspend fun ensureChains() {
         iptables("-t nat -N $CHAIN_NAT")
