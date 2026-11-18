@@ -147,6 +147,7 @@
  * take net.h's netlink context or handshake. */
 #include "config/config.h"
 #include "net/net.h"
+#include "net/hostlan.h"
 
 #include "android/android.h"
 #include "boot/boot.h"

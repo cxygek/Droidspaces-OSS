@@ -87,6 +87,7 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/net/dhcp/proto.c \
        $(SRC_DIR)/net/dhcp/server.c \
        $(SRC_DIR)/net/dhcp/ra.c \
+       $(SRC_DIR)/net/hostlan.c \
        $(SRC_DIR)/net/naming.c \
        $(SRC_DIR)/net/netns.c \
        $(SRC_DIR)/net/dns.c \

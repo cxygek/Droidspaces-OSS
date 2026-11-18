@@ -502,6 +502,12 @@ reboot_loop:;
          * a replugged USB adapter gets the container's eth0 back. */
         if (cfg->net_mode == DS_NET_MACVLAN && ++net_tick % 4 == 0)
           ds_net_macvlan_wire(cfg, cfg->container_pid, 0);
+
+        /* The host's own cable into a container LAN is torn out whenever the
+         * gateway rebuilds its bridge, and nothing else would put it back.
+         * Every monitor runs this; the state lock keeps one of them working. */
+        if (ds_hostlan_configured() && ++net_tick % 8 == 0)
+          ds_hostlan_reconcile();
       }
 
       /* Poll the signalfd and, in background mode, the console PTY master.

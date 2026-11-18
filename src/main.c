@@ -305,7 +305,11 @@ int main(int argc, char **argv) {
    * take a live shell with it. */
   int is_local_cmd =
       (discovered_cmd && (strcmp(discovered_cmd, "session") == 0 ||
-                          strcmp(discovered_cmd, "enter") == 0));
+                          strcmp(discovered_cmd, "enter") == 0 ||
+                          /* net touches the host's own interfaces; the daemon
+                           * being optional must not decide whether the host
+                           * can join a container LAN. */
+                          strcmp(discovered_cmd, "net") == 0));
 
   if (!is_daemon_cmd && !is_no_root_cmd && !is_local_cmd &&
       getenv("DS_NO_PROXY") == NULL) {
@@ -464,6 +468,34 @@ int main(int argc, char **argv) {
   if (strcmp(cmd, "scan") == 0) {
     scan_containers();
     ret = 0;
+    goto cleanup;
+  }
+
+  if (strcmp(cmd, "net") == 0) {
+    const char *action = (optind + 1 < argc) ? argv[optind + 1] : NULL;
+    if (!action) {
+      ds_error("Missing net action.");
+      ds_log("Use '" C_BOLD "%s net status" C_RESET "', "
+             "'" C_BOLD "net join" C_RESET "' or "
+             "'" C_BOLD "net leave" C_RESET "'.",
+             cfg.prog_name);
+      ret = 1;
+    } else if (strcmp(action, "status") == 0) {
+      ret = ds_hostlan_status(cfg.json_output);
+    } else if (strcmp(action, "join") == 0) {
+      /* net join [bridge]. A positional, not an option: the global parser
+       * owns everything that starts with a dash and would reject it. */
+      const char *bridge = (optind + 2 < argc) ? argv[optind + 2] : NULL;
+      ret = ds_hostlan_join(bridge);
+    } else if (strcmp(action, "leave") == 0) {
+      ret = ds_hostlan_leave();
+    } else if (strcmp(action, "dhcp") == 0) {
+      /* Internal: the lease keeper spawned by join. Not in usage. */
+      ret = ds_hostlan_dhcp_run();
+    } else {
+      ds_error("Unknown net action: %s", action);
+      ret = 1;
+    }
     goto cleanup;
   }
 
