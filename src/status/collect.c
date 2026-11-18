@@ -85,22 +85,43 @@ static void netns_addrs(pid_t pid, char *v4, size_t v4_size, char *v6,
     if (getifaddrs(&ifa) == 0) {
       size_t pos4 = 0, pos6 = 0;
       int room4 = 1, room6 = 1;
-      for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+
+      /* The runtime always names its primary cable eth0 (and the LAN side of
+       * a gateway eth1); anything else - a docker0 the container made for
+       * itself, a tunnel - is the guest's own business. The dump order is
+       * whatever the kernel's hash says, so eth0/eth1 are picked out
+       * explicitly: the first address a reader sees should be one a forward
+       * can actually reach, not 172.17.0.1 from a bridge inside the guest. */
+      for (int pass = 0; pass < 3 && room4; pass++) {
+        for (struct ifaddrs *p = ifa; p && room4; p = p->ifa_next) {
+          const char *n = p->ifa_name ? p->ifa_name : "";
+          if (pass == 0 && strcmp(n, "eth0") != 0)
+            continue;
+          if (pass == 1 && strcmp(n, "eth1") != 0)
+            continue;
+          if (pass == 2 && (strcmp(n, "eth0") == 0 || strcmp(n, "eth1") == 0))
+            continue;
+          if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET)
+            continue;
+          char ip[INET6_ADDRSTRLEN];
+          inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr,
+                    ip, sizeof(ip));
+          if (strncmp(ip, "127.", 4) != 0)
+            room4 = addr_append(v4, v4_size, &pos4, ip);
+        }
+      }
+
+      for (struct ifaddrs *p = ifa; p && room6; p = p->ifa_next) {
         char ip[INET6_ADDRSTRLEN];
         if (!p->ifa_addr)
           continue;
-        if (p->ifa_addr->sa_family == AF_INET && room4) {
-          inet_ntop(AF_INET, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, ip,
-                    sizeof(ip));
-          if (strncmp(ip, "127.", 4) != 0)
-            room4 = addr_append(v4, v4_size, &pos4, ip);
-        } else if (p->ifa_addr->sa_family == AF_INET6 && room6) {
-          struct in6_addr *a = &((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr;
-          if (IN6_IS_ADDR_LOOPBACK(a) || IN6_IS_ADDR_LINKLOCAL(a))
-            continue;
-          inet_ntop(AF_INET6, a, ip, sizeof(ip));
-          room6 = addr_append(v6, v6_size, &pos6, ip);
-        }
+        if (p->ifa_addr->sa_family != AF_INET6)
+          continue;
+        struct in6_addr *a = &((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(a) || IN6_IS_ADDR_LINKLOCAL(a))
+          continue;
+        inet_ntop(AF_INET6, a, ip, sizeof(ip));
+        room6 = addr_append(v6, v6_size, &pos6, ip);
       }
       freeifaddrs(ifa);
     }

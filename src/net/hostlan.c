@@ -206,6 +206,11 @@ static int keeper_alive(void) {
 }
 
 static int keeper_spawn(void) {
+  /* Every join used to spawn one more keeper; they all ask for the same lease
+   * on the same MAC, so the extras are pure noise in ps. One is enough. */
+  if (keeper_alive())
+    return 0;
+
   char exe[PATH_MAX];
   ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
   if (n <= 0) {
