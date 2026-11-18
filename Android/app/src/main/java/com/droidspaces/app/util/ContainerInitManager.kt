@@ -1,7 +1,6 @@
 package com.droidspaces.app.util
 
 import android.content.Context
-import android.util.Base64
 import android.util.Log
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -27,12 +26,11 @@ data class CommandResult(val exitCode: Int, val output: List<String>, val error:
 
 /**
  * What the four init-system managers share: a query script shipped as an asset
- * and streamed into the container base64-encoded, a bounded runner for the
+ * and handed to a shell inside the container, a bounded runner for the
  * management commands, the availability probe, and the list build from the
  * NAME|DESCRIPTION lines the scripts print. Every service name that reaches a
  * command passes [isSafeServiceName] first: it was discovered inside a rootfs
- * that may be hostile and lands inside the single-quoted `run '...'` payload of
- * a host-root shell command, where one quote would break out of the payload.
+ * that may be hostile, and this class builds commands for a host-root shell.
  */
 abstract class ContainerInitManager(
     private val scriptAsset: String,
@@ -40,7 +38,7 @@ abstract class ContainerInitManager(
     private val timeoutMs: Long = 10_000L,
 ) {
     private val tag = javaClass.simpleName
-    private var scriptBase64: String? = null
+    private var script: String? = null
 
     companion object {
         // Letters, digits and the punctuation real unit names use (systemd templates
@@ -52,17 +50,36 @@ abstract class ContainerInitManager(
     }
 
     fun initialize(context: Context) {
-        if (scriptBase64 == null) {
-            try {
-                scriptBase64 = Base64.encodeToString(context.assets.open(scriptAsset).use { it.readBytes() }, Base64.NO_WRAP)
+        if (script == null) {
+            script = try {
+                context.assets.open(scriptAsset).bufferedReader().use { it.readText() }
             } catch (e: Exception) {
                 Log.e(tag, "Failed to load $scriptAsset from assets", e)
+                null
             }
         }
     }
 
     private fun inContainer(containerName: String, command: String) =
-        "${Constants.DROIDSPACES_BINARY_PATH} --name=${ContainerCommandBuilder.quote(containerName)} run '$command'"
+        "${Constants.DROIDSPACES_BINARY_PATH} --name=${ContainerCommandBuilder.quote(containerName)} run ${ContainerCommandBuilder.quote(command)}"
+
+    /**
+     * The query script as the argument of a shell in the container, with [flag]
+     * (and a service name) as its positional arguments. `run` hands an argument
+     * that contains a space to /bin/sh -c, so the script arrives verbatim and
+     * needs no tool from the container to be unpacked.
+     *
+     * It used to be base64-encoded and decoded with `base64 -d` inside the
+     * container. On an image without that command - OpenWrt 25.x no longer ships
+     * coreutils-base64 - the decoder failed mid-pipeline, sh got empty input and
+     * exited 0, and every service list silently came back empty instead of
+     * reporting an error. sh and its builtins are all this needs now.
+     */
+    private fun scriptCommand(flag: String, name: String? = null): String? {
+        val text = script ?: return null
+        val args = if (name == null) flag else "$flag ${ContainerCommandBuilder.quote(name)}"
+        return "sh -c ${ContainerCommandBuilder.quote(text)} sh $args"
+    }
 
     /**
      * [command] inside the container, through the shared root shell, for as long as
@@ -78,14 +95,13 @@ abstract class ContainerInitManager(
 
     /** The query script's output for one flag; false when the script is missing or failed. */
     protected suspend fun runScript(containerName: String, flag: String): Pair<Boolean, List<String>> {
-        val b64 = scriptBase64 ?: return Pair(false, emptyList())
-        val result = exec(containerName, "echo $b64 | base64 -d | sh -s -- $flag")
+        val command = scriptCommand(flag) ?: return Pair(false, emptyList())
+        val result = exec(containerName, command)
         return Pair(result.isSuccess, result.output)
     }
 
     /** The script's own action on a service, for an init whose script owns the tool paths. */
-    protected fun scriptAction(flag: String, name: String): String? =
-        scriptBase64?.let { "echo $it | base64 -d | sh -s -- $flag $name" }
+    protected fun scriptAction(flag: String, name: String): String? = scriptCommand(flag, name)
 
     /**
      * A management command, bounded by [timeoutMs] so a hung init tool cannot hang
@@ -94,7 +110,7 @@ abstract class ContainerInitManager(
      */
     suspend fun run(containerName: String, command: String): CommandResult =
         withTimeoutOrNull(timeoutMs) { exec(containerName, "$command 2>&1") } ?: run {
-            // The first token names the tool; the rest may be a base64 blob logcat would truncate.
+            // The first token names the tool; the rest may be a whole script logcat would truncate.
             Log.e(tag, "Command timed out: ${command.take(120)}")
             CommandResult(124, listOf("Command timed out after ${timeoutMs / 1000} seconds"), emptyList())
         }

@@ -1,6 +1,5 @@
 package com.droidspaces.app.util
 
-import android.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -82,15 +81,16 @@ object ContainerSystemdManager : ContainerInitManager("chksystemd.sh", "command 
         return if (result.isSuccess && result.output.isNotEmpty()) result.output.joinToString("\n") else null
     }
 
-    /** Writes override.conf and reloads systemd. The content is base64-streamed, like the
-     * query script, so user-typed quotes, `$` or backticks never leave the single-quoted payload.
+    /** Writes override.conf and reloads systemd. The content is single-quoted into the
+     * payload, so user-typed quotes, `$` or backticks reach the file verbatim and no
+     * decoder has to exist in the container.
      * Unbounded on purpose: daemon-reload on a big unit set outlives the action timeout, and
      * a deadline here would report a write that already happened as failed. */
     suspend fun setOverrideConf(containerName: String, unitName: String, content: String): CommandResult {
         if (!isSafeServiceName(unitName))
             return CommandResult(2, emptyList(), listOf("Invalid unit name: $unitName"))
-        val b64 = Base64.encodeToString(content.toByteArray(), Base64.NO_WRAP)
-        return exec(containerName, "mkdir -p ${overrideDirPath(unitName)} && echo $b64 | base64 -d > ${overridePath(unitName)} && systemctl daemon-reload 2>&1")
+        val body = ContainerCommandBuilder.quote(content)
+        return exec(containerName, "mkdir -p ${overrideDirPath(unitName)} && printf '%s' $body > ${overridePath(unitName)} && systemctl daemon-reload 2>&1")
     }
 
     /** Removes override.conf and its drop-in dir if that is now empty, then reloads systemd. */
