@@ -489,14 +489,6 @@ int main(int argc, char **argv) {
       ret = ds_hostlan_join(bridge);
     } else if (strcmp(action, "leave") == 0) {
       ret = ds_hostlan_leave();
-    } else if (strcmp(action, "forwards") == 0) {
-      /* Re-assert the saved port forwards. The monitors call this on their own;
-       * the command is here so it can be run by hand. */
-      int applied = ds_hostnet_forwards_apply();
-      ret = 0;
-      if (!cfg.json_output)
-        ds_log("[NET] Port forwards: %d rule%s from disk", applied,
-               applied == 1 ? "" : "s");
     } else if (strcmp(action, "dhcp") == 0) {
       /* Internal: the lease keeper spawned by join. Not in usage. */
       ret = ds_hostlan_dhcp_run();
