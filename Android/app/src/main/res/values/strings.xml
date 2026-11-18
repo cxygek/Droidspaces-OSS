@@ -787,6 +787,9 @@
     <string name="port_forward_host_port">Phone port</string>
     <string name="port_forward_container_port">Container port</string>
     <string name="port_forward_bad_port">Ports must be between 1 and 65535.</string>
+    <string name="port_forward_span_mismatch">A target span must be as long as the phone span.</string>
+    <string name="forward_sort_port">Port order</string>
+    <string name="forward_sort_container">By container</string>
     <string name="port_forward_failed">The rule could not be applied.</string>
     <string name="port_forward_same_port">%1$s, same port inside</string>
     <string name="host_port">Host port</string>

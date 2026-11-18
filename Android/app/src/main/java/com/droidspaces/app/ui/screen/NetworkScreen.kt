@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -31,6 +32,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.annotation.StringRes
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -79,6 +81,7 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
     var busyLan by remember { mutableStateOf(false) }
     var busyForwarding by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
+    var forwardSort by remember { mutableStateOf(ForwardSort.PORT) }
     var chosenBridge by remember { mutableStateOf<String?>(null) }
     var notice by remember { mutableStateOf<String?>(null) }
 
@@ -89,7 +92,8 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         val lanPrefix = st?.ip?.takeIf { it.isNotBlank() }?.substringBeforeLast('.')?.plus(".")
         running = HostNetworkManager.runningContainers(lanPrefix)
         forwardingOn = HostNetworkManager.forwardingEnabled()
-        forwards = HostNetworkManager.forwardStates(HostNetworkManager.listForwards(), running)
+        forwards = HostNetworkManager.forwardStates(
+            HostNetworkManager.listForwards(), running, forwardingOn)
     }
 
     LaunchedEffect(Unit) {
@@ -150,6 +154,16 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         ForwardingCard(
             enabled = forwardingOn,
             busy = busyForwarding,
+            entries = sortedForwards(forwards, forwardSort),
+            sort = forwardSort,
+            onSort = { forwardSort = it },
+            onAdd = { adding = true },
+            onDelete = { rule ->
+                scope.launch {
+                    HostNetworkManager.removeForward(rule)
+                    refresh()
+                }
+            },
             onToggle = { want ->
                 scope.launch {
                     busyForwarding = true
@@ -162,48 +176,6 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
                 }
             }
         )
-
-        when {
-            forwards.isEmpty() -> Text(
-                context.getString(R.string.port_forwards_empty),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            else -> forwards.forEach { entry ->
-                ForwardRow(entry) {
-                    scope.launch {
-                        HostNetworkManager.removeForward(entry.rule)
-                        refresh()
-                    }
-                }
-            }
-        }
-
-        Surface(
-            onClick = { adding = true },
-            modifier = Modifier.fillMaxWidth(),
-            shape = MaterialTheme.shapes.medium,
-            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
-            tonalElevation = 0.dp
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    Icons.Default.Add,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    context.getString(R.string.port_forward_add),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
-        }
 
         notice?.let {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
@@ -328,6 +300,11 @@ private fun HostLanCard(
 private fun ForwardingCard(
     enabled: Boolean,
     busy: Boolean,
+    entries: List<ForwardStatus>,
+    sort: ForwardSort,
+    onSort: (ForwardSort) -> Unit,
+    onAdd: () -> Unit,
+    onDelete: (HostForward) -> Unit,
     onToggle: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -337,7 +314,7 @@ private fun ForwardingCard(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         tonalElevation = 0.dp
     ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Default.SwapHoriz,
@@ -352,6 +329,16 @@ private fun ForwardingCard(
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f)
                 )
+                // How the list below is ordered, then the way to add to it.
+                SortChip(sort, enabled = entries.size > 1) { onSort(sort.other()) }
+                IconButton(onClick = onAdd, enabled = !busy) {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = context.getString(R.string.port_forward_add),
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
                 Switch(checked = enabled, onCheckedChange = onToggle, enabled = !busy)
             }
             Text(
@@ -366,9 +353,67 @@ private fun ForwardingCard(
                     color = MaterialTheme.colorScheme.error
                 )
             }
+
+            when {
+                entries.isEmpty() -> Text(
+                    context.getString(R.string.port_forwards_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                else -> Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = RULE_LIST_MAX_HEIGHT)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    entries.forEach { entry ->
+                        ForwardRow(entry) { onDelete(entry.rule) }
+                    }
+                }
+            }
         }
     }
 }
+
+/** Bounded so a long list scrolls inside the card instead of pushing the page. */
+private val RULE_LIST_MAX_HEIGHT = 300.dp
+
+@Composable
+private fun SortChip(sort: ForwardSort, enabled: Boolean, onClick: () -> Unit) {
+    val context = LocalContext.current
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        shape = MaterialTheme.shapes.small,
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Text(
+            context.getString(sort.labelRes),
+            style = MaterialTheme.typography.labelMedium,
+            color = if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+        )
+    }
+}
+
+private enum class ForwardSort(@StringRes val labelRes: Int) {
+    PORT(R.string.forward_sort_port),
+    CONTAINER(R.string.forward_sort_container);
+
+    fun other(): ForwardSort = if (this == PORT) CONTAINER else PORT
+}
+
+private fun sortedForwards(entries: List<ForwardStatus>, sort: ForwardSort): List<ForwardStatus> =
+    when (sort) {
+        ForwardSort.PORT -> entries.sortedWith(
+            compareBy({ it.rule.hostPort }, { it.rule.container.lowercase() })
+        )
+        ForwardSort.CONTAINER -> entries.sortedWith(
+            compareBy({ it.rule.container.lowercase() }, { it.rule.hostPort })
+        )
+    }
 
 private fun bridgeLabel(context: android.content.Context, bridge: LanBridge): String =
     "${bridge.name}  ·  " + context.getString(R.string.host_lan_members, bridge.members)
@@ -399,7 +444,7 @@ private fun ForwardRow(entry: ForwardStatus, onDelete: () -> Unit) {
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
-                    "${entry.rule.hostPort} → ${entry.rule.container}:${entry.rule.containerPort}",
+                    "${entry.rule.hostLabel} → ${entry.rule.container}:${entry.rule.containerLabel}",
                     style = MaterialTheme.typography.bodyLarge
                 )
                 Text(
@@ -432,8 +477,29 @@ private fun AddForwardDialog(
     var containerPort by remember { mutableStateOf("") }
     var proto by remember { mutableStateOf("tcp") }
 
-    fun validPort(v: String) = v.toIntOrNull()?.let { it in 1..65535 } == true
-    val portsOk = validPort(hostPort) && (containerPort.isBlank() || validPort(containerPort))
+    /* "8080" or "2000-2010" → (first port, how many), null when it is neither.
+     * A span is capped where the field stops being readable; one rule per port
+     * means a span of a thousand would file a thousand iptables calls. */
+    fun parseSpan(v: String): Pair<Int, Int>? {
+        val parts = v.split('-', limit = 2)
+        val first = parts[0].toIntOrNull() ?: return null
+        val last = parts.getOrNull(1)?.toIntOrNull() ?: first
+        if (first !in 1..65535 || last !in 1..65535 || last < first || last - first > 127)
+            return null
+        return first to (last - first + 1)
+    }
+
+    val hostSpan = parseSpan(hostPort)
+    val targetSpan = parseSpan(containerPort)
+    /* Both sides move together, one container port per host port. A single
+     * container port under a span is the base of the target span; a target
+     * span must be exactly as long as the host one. */
+    val portsOk = hostSpan != null && (
+        containerPort.isBlank() || targetSpan != null &&
+            (targetSpan.second == 1 || targetSpan.second == hostSpan.second)
+        )
+    val spanMismatch = hostSpan != null && targetSpan != null &&
+        targetSpan.second > 1 && targetSpan.second != hostSpan.second
     val canAdd = target != null && target?.ip?.isNotBlank() == true && portsOk
 
     DsDialog(
@@ -445,13 +511,19 @@ private fun AddForwardDialog(
                 onDismiss = onDismiss,
                 onConfirm = {
                     val t = target ?: return@DialogFooterRow
+                    val host = hostSpan ?: return@DialogFooterRow
+                    val targetPorts = when {
+                        containerPort.isBlank() -> host
+                        else -> targetSpan ?: return@DialogFooterRow
+                    }
                     onConfirm(
                         HostForward(
                             proto = proto,
-                            hostPort = hostPort.toInt(),
+                            hostPort = host.first,
                             container = t.name,
                             containerIp = t.ip,
-                            containerPort = containerPort.ifBlank { hostPort }.toInt()
+                            containerPort = targetPorts.first,
+                            count = host.second,
                         )
                     )
                 },
@@ -494,7 +566,11 @@ private fun AddForwardDialog(
 
         OutlinedTextField(
             value = hostPort,
-            onValueChange = { if (it.length <= 5 && it.all { ch -> ch.isDigit() }) hostPort = it },
+            onValueChange = { text ->
+                if (text.length <= 11 && text.count { it == '-' } <= 1 &&
+                    text.all { it.isDigit() || it == '-' })
+                    hostPort = text
+            },
             label = { Text(context.getString(R.string.port_forward_host_port)) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
@@ -504,7 +580,11 @@ private fun AddForwardDialog(
         )
         OutlinedTextField(
             value = containerPort,
-            onValueChange = { if (it.length <= 5 && it.all { ch -> ch.isDigit() }) containerPort = it },
+            onValueChange = { text ->
+                if (text.length <= 11 && text.count { it == '-' } <= 1 &&
+                    text.all { it.isDigit() || it == '-' })
+                    containerPort = text
+            },
             label = { Text(context.getString(R.string.port_forward_container_port)) },
             placeholder = { Text(hostPort) },
             singleLine = true,
@@ -535,7 +615,10 @@ private fun AddForwardDialog(
         }
         if (hostPort.isNotEmpty() && !portsOk) {
             Text(
-                context.getString(R.string.port_forward_bad_port),
+                context.getString(
+                    if (spanMismatch) R.string.port_forward_span_mismatch
+                    else R.string.port_forward_bad_port
+                ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error
             )

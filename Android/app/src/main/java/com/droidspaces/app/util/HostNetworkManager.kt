@@ -53,7 +53,18 @@ data class HostForward(
     val container: String,
     val containerIp: String,
     val containerPort: Int,
-)
+    /** How many ports the rule covers, one by default. 2000-2010 is 11. */
+    val count: Int = 1,
+) {
+    val hostLast: Int get() = hostPort + count - 1
+    val containerLast: Int get() = containerPort + count - 1
+
+    val hostLabel: String
+        get() = if (count <= 1) "$hostPort" else "$hostPort-$hostLast"
+
+    val containerLabel: String
+        get() = if (count <= 1) "$containerPort" else "$containerPort-$containerLast"
+}
 
 /**
  * A running container, the address to prefer when pointing something at it, and
@@ -323,13 +334,25 @@ object HostNetworkManager {
             val o = running.optJSONObject(i) ?: return@mapNotNull null
             val name = o.optString("name")
             val addrs = o.optString("ip").split(',').map { it.trim() }.filter { it.isNotEmpty() }
-            val ip = when {
-                lanPrefix == null -> addrs.firstOrNull().orEmpty()
-                else -> addrs.firstOrNull { it.startsWith(lanPrefix) } ?: addrs.firstOrNull().orEmpty()
-            }
+            val ip = preferredAddress(addrs, lanPrefix)
             if (name.isEmpty()) null
             else RunningContainer(name, ip, addrs, o.optInt("pid"))
         }
+    }
+
+    /**
+     * Which of a container's addresses to aim at. Prefer the LAN the host is
+     * actually joined to, then trust the order the backend reports: it lists
+     * its own cables (eth0, eth1) before any bridge the guest created itself.
+     */
+    private fun preferredAddress(addresses: List<String>, lanPrefix: String?): String {
+        if (lanPrefix != null)
+            addresses.firstOrNull { it.startsWith(lanPrefix) }?.let { return it }
+        /* The backend lists the runtime's own cables (eth0, then eth1) ahead of
+         * anything the guest made for itself, so the first address is always
+         * one a forward can reach. Guessing by range here used to skip this
+         * runtime's own NAT network (172.28.0.0/16 sits in docker's pool). */
+        return addresses.firstOrNull().orEmpty()
     }
 
     // ── Forwards: the file is the truth, iptables is derived from it ────────
@@ -363,16 +386,39 @@ object HostNetworkManager {
             if (trimmed.isEmpty() || trimmed.startsWith("#")) return@mapNotNull null
             val parts = trimmed.split('|')
             if (parts.size != 5) return@mapNotNull null
-            val hostPort = parts[1].toIntOrNull() ?: return@mapNotNull null
-            val containerPort = parts[4].toIntOrNull() ?: return@mapNotNull null
-            HostForward(parts[0], hostPort, parts[2], parts[3], containerPort)
+            val host = portSpan(parts[1]) ?: return@mapNotNull null
+            val container = portSpan(parts[4]) ?: return@mapNotNull null
+            /* Both sides move together: one host port per container port. A
+             * single container port is repeated across the span. */
+            HostForward(
+                proto = parts[0],
+                hostPort = host.first,
+                container = parts[2],
+                containerIp = parts[3],
+                containerPort = container.first,
+                count = host.second,
+            )
         }
+
+    /** "8080" or "2000-2010" to (first, count), null when it is neither. */
+    private fun portSpan(text: String): Pair<Int, Int>? {
+        val trimmed = text.trim()
+        if ('-' !in trimmed) {
+            val port = trimmed.toIntOrNull() ?: return null
+            return if (port in 1..65535) port to 1 else null
+        }
+        val bounds = trimmed.split('-', limit = 2)
+        val from = bounds[0].toIntOrNull() ?: return null
+        val to = bounds.getOrNull(1)?.toIntOrNull() ?: return null
+        if (from !in 1..65535 || to !in from..65535) return null
+        return from to (to - from + 1)
+    }
 
     private suspend fun writeForwards(rules: List<HostForward>): Boolean {
         val lines = buildList {
             add("# Host port forwards, one per line: proto|host|container|ip|port")
             rules.forEach {
-                add("${it.proto}|${it.hostPort}|${it.container}|${it.containerIp}|${it.containerPort}")
+                add("${it.proto}|${it.hostLabel}|${it.container}|${it.containerIp}|${it.containerLabel}")
             }
         }
         return writeRootFile(FORWARDS_PATH, lines.joinToString("\n"))
@@ -397,27 +443,42 @@ object HostNetworkManager {
         return nat to forward
     }
 
-    private fun hasRedirect(nat: List<String>, rule: HostForward): Boolean = nat.any { line ->
-        line.contains("-p ${rule.proto}") &&
-            line.contains("--dport ${rule.hostPort} ") &&
-            line.contains("--to-destination ${rule.containerIp}:${rule.containerPort}")
-    }
+    /** Every port in the rule, one line per port, is what the kernel holds. */
+    private fun hasRedirect(nat: List<String>, rule: HostForward): Boolean =
+        (0 until rule.count).all { offset ->
+            val host = rule.hostPort + offset
+            val inside = rule.containerPort + offset
+            nat.any { line ->
+                line.contains("-p ${rule.proto}") &&
+                    line.contains("--dport $host ") &&
+                    line.contains("--to-destination ${rule.containerIp}:$inside")
+            }
+        }
 
-    private fun hasAccept(forward: List<String>, rule: HostForward): Boolean = forward.any { line ->
-        line.contains("-d ${rule.containerIp}") &&
-            line.contains("--dport ${rule.containerPort} ") &&
-            line.contains("-j ACCEPT")
-    }
+    private fun hasAccept(forward: List<String>, rule: HostForward): Boolean =
+        (0 until rule.count).all { offset ->
+            val inside = rule.containerPort + offset
+            forward.any { line ->
+                line.contains("-d ${rule.containerIp}") &&
+                    line.contains("--dport $inside ") &&
+                    line.contains("-j ACCEPT")
+            }
+        }
 
     suspend fun forwardStates(
         rules: List<HostForward>,
         containers: List<RunningContainer>,
+        forwardingOn: Boolean,
     ): List<ForwardStatus> {
         if (rules.isEmpty()) return emptyList()
         val (nat, forward) = chainLines()
         return rules.map { rule ->
             val live = containers.firstOrNull { it.name == rule.container }
+            /* The switch decides first: with forwarding off there is nothing in
+             * the kernel, so "not applied" is the truth about every rule,
+             * whatever the container is doing. */
             val state = when {
+                !forwardingOn -> ForwardState.INACTIVE
                 live == null -> ForwardState.STOPPED
                 !live.holds(rule.containerIp) && live.sameSubnet(rule.containerIp) ->
                     ForwardState.DRIFTED
@@ -493,8 +554,11 @@ object HostNetworkManager {
          * already matches the file, and re-installing is a dozen root shells
          * the user would wait through every time the tab opens. */
         val (nat, forward) = chainLines()
+        // A span writes one chain line per port, so the counts to match are
+        // the ports, not the rules.
+        val ports = followed.sumOf { it.count }
         val upToDate = followed.all { hasRedirect(nat, it) && hasAccept(forward, it) } &&
-            nat.size == followed.size && forward.size == followed.size
+            nat.size == ports && forward.size == ports
         if (upToDate) {
             if (followed.isNotEmpty())
                 info("${followed.size} rule${if (followed.size == 1) "" else "s"} already applied.")
@@ -527,13 +591,19 @@ object HostNetworkManager {
     private suspend fun install(rule: HostForward, subnet: String?): Boolean {
         ensureChains()
 
-        val dnat = "$CHAIN_NAT -p ${rule.proto} --dport ${rule.hostPort} " +
-            "-m comment --comment $TAG -j DNAT --to-destination ${rule.containerIp}:${rule.containerPort}"
-        if (!iptables("-t nat -C $dnat") && !iptables("-t nat -A $dnat")) return false
+        for (offset in 0 until rule.count) {
+            val host = rule.hostPort + offset
+            val inside = rule.containerPort + offset
 
-        val accept = "$CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} " +
-            "--dport ${rule.containerPort} -m comment --comment $TAG -j ACCEPT"
-        if (!iptables("-C $accept")) iptables("-A $accept")
+            val dnat = "$CHAIN_NAT -p ${rule.proto} --dport $host " +
+                "-m comment --comment $TAG -j DNAT --to-destination ${rule.containerIp}:$inside"
+            if (!iptables("-t nat -C $dnat") && !iptables("-t nat -A $dnat"))
+                return false
+
+            val accept = "$CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} " +
+                "--dport $inside -m comment --comment $TAG -j ACCEPT"
+            if (!iptables("-C $accept")) iptables("-A $accept")
+        }
 
         // A container's reply has to come back out the same way; the gateway
         // container's own NAT only covers traffic it routes itself.
@@ -553,13 +623,17 @@ object HostNetworkManager {
     }
 
     private suspend fun uninstall(rule: HostForward) {
-        iptables(
-            "-t nat -D $CHAIN_NAT -p ${rule.proto} --dport ${rule.hostPort} " +
-                "-m comment --comment $TAG -j DNAT --to-destination ${rule.containerIp}:${rule.containerPort}"
-        )
-        iptables(
-            "-D $CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} --dport ${rule.containerPort} " +
-                "-m comment --comment $TAG -j ACCEPT"
-        )
+        for (offset in 0 until rule.count) {
+            val host = rule.hostPort + offset
+            val inside = rule.containerPort + offset
+            iptables(
+                "-t nat -D $CHAIN_NAT -p ${rule.proto} --dport $host " +
+                    "-m comment --comment $TAG -j DNAT --to-destination ${rule.containerIp}:$inside"
+            )
+            iptables(
+                "-D $CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} --dport $inside " +
+                    "-m comment --comment $TAG -j ACCEPT"
+            )
+        }
     }
 }
