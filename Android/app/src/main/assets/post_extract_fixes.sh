@@ -283,7 +283,7 @@ EOF
     # installed before it existed.
     log "Applying network mode guards to network services..."
     for unit in NetworkManager.service dhcpcd.service systemd-resolved.service systemd-networkd.service; do
-        if $TEST -f "$ROOTFS_PATH/$GUEST_SYSTEMD_PATH/$unit" || $TEST -e "$ROOTFS_PATH/etc/systemd/system/multi-user.target.wants/$unit"; then
+        if $TEST -f "$ROOTFS_PATH/$GUEST_SYSTEMD_PATH/$unit" || $TEST -L "$ROOTFS_PATH/etc/systemd/system/multi-user.target.wants/$unit"; then
             $MKDIR -p "$ROOTFS_PATH/etc/systemd/system/${unit}.d"
             $CAT > "$ROOTFS_PATH/etc/systemd/system/${unit}.d/99-netmode-limit.conf" << 'EOF'
 [Service]
@@ -318,7 +318,7 @@ EOF
     # distro's own dhcpcd.service runs, which then covers eth0 itself.
     if $TEST -f "$ROOTFS_PATH/$GUEST_SYSTEMD_PATH/NetworkManager.service" &&
         ! $TEST -f "$ROOTFS_PATH/$GUEST_SYSTEMD_PATH/systemd-networkd.service" &&
-        ! $TEST -e "$ROOTFS_PATH/etc/systemd/system/multi-user.target.wants/dhcpcd.service" &&
+        ! $TEST -L "$ROOTFS_PATH/etc/systemd/system/multi-user.target.wants/dhcpcd.service" &&
         { $TEST -x "$ROOTFS_PATH/usr/sbin/dhcpcd" || $TEST -x "$ROOTFS_PATH/sbin/dhcpcd"; }; then
         log "Adding the macvlan dhcpcd fallback for NetworkManager..."
         $CAT > "$ROOTFS_PATH/etc/systemd/system/droidspaces-macvlan-dhcp.service" << 'EOF'
@@ -503,6 +503,22 @@ EOT
         rc_disable dhcpcd default
     fi
 
+    # ifupdown-ng's networking service already leases eth0 through dhcpcd (or
+    # udhcpc). An enabled dhcpcd service starts a second client on the same
+    # veth; whichever loses leaves the container with no default route and no
+    # resolver. setup-alpine inside a Droidspaces rootfs can enable both, so
+    # drop the service whenever networking owns eth0.
+    # runlevel entries are absolute symlinks into the rootfs and are dangling
+    # here, so check -L rather than -e.
+    if $TEST -x "$ROOTFS_PATH/usr/libexec/ifupdown-ng/dhcp" &&
+        { $TEST -L "$ROOTFS_PATH/etc/runlevels/boot/networking" ||
+          $TEST -L "$ROOTFS_PATH/etc/runlevels/default/networking"; } &&
+        $GREP -qE '^[[:space:]]*iface[[:space:]]+eth[0-9]+[[:space:]]+inet[[:space:]]+dhcp([[:space:]]|$)' \
+            "$ROOTFS_PATH/etc/network/interfaces" 2>/dev/null; then
+        log "ifupdown-ng owns eth0; disabling the dhcpcd service..."
+        rc_disable dhcpcd default
+    fi
+
     # Artix boots with openrc-init and agetty.<port> services. Drop the VT
     # gettys and add one on /dev/console for the Droidspaces foreground console.
     if $TEST -f "$ROOTFS_PATH/etc/init.d/agetty" && $TEST -f "$ROOTFS_PATH/etc/conf.d/agetty.tty1"; then
@@ -526,7 +542,9 @@ fi
 if $TEST -f "$ROOTFS_PATH/etc/inittab" && $GREP -q '::sysinit:' "$ROOTFS_PATH/etc/inittab"; then
     log "BusyBox inittab detected, moving getty to /dev/console..."
     $SED -i '/^tty[1-6]::/d' "$ROOTFS_PATH/etc/inittab"
-    $GREP -q 'console::respawn' "$ROOTFS_PATH/etc/inittab" || \
+    # Alpine writes "::respawn:/sbin/getty 38400 console". Looking only for
+    # "console::respawn" misses that line and starts a second getty on console.
+    $GREP -qE '^[^#].*respawn:.*getty.*console' "$ROOTFS_PATH/etc/inittab" || \
         $ECHO 'console::respawn:/sbin/getty 38400 console' >> "$ROOTFS_PATH/etc/inittab"
     if $TEST -f "$ROOTFS_PATH/etc/securetty"; then
         $GREP -q '^console$' "$ROOTFS_PATH/etc/securetty" || $ECHO 'console' >> "$ROOTFS_PATH/etc/securetty"
@@ -567,6 +585,15 @@ start_pre() {
 	if ! grep -qs '^net_mode=' /run/droidspaces/container.config ||
 		grep -qsE '^net_mode=(host|none)$' /run/droidspaces/container.config; then
 		einfo "Skipping dhcpcd: host or none network mode"
+		return 1
+	fi
+	# setup-alpine can enable this service alongside ifupdown-ng's networking.
+	# Two clients on one veth strip each other's default route and resolver.
+	if { [ -e /etc/runlevels/boot/networking ] ||
+	     [ -e /etc/runlevels/default/networking ]; } &&
+		grep -qsE '^[[:space:]]*iface[[:space:]]+eth[0-9]+[[:space:]]+inet[[:space:]]+dhcp' \
+		/etc/network/interfaces 2>/dev/null; then
+		einfo "Skipping dhcpcd: networking already manages eth0"
 		return 1
 	fi
 	checkpath -d /run/dhcpcd
