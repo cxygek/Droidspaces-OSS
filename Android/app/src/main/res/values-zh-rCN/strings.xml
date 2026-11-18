@@ -175,7 +175,7 @@
     <string name="check_requirements">检查要求</string>
     <string name="notification_permission_rationale">Droidspaces 需要显示一个常驻通知，以保持您的终端会话在后台运行。否则，Android 系统（尤其是三星设备）可能会意外终止终端服务。</string>
     <string name="invalid_number">无效的数字</string>
-    <string name="maximum_size_512gb">最大容量为 512 GB</string>
+    <string name="maximum_size_gb">最大容量为 %1$d GB</string>
     <string name="error_hostname_invalid">主机名只能包含字母、数字和连字符“-”</string>
     <string name="migrate_to_sparse_image">迁移至稀疏镜像</string>
     <string name="resize_dialog_title">调整稀疏镜像容量</string>
@@ -190,8 +190,8 @@
     <string name="image_size">镜像大小</string>
     <string name="requirements_check_title">检查要求</string>
     <string name="resize_dialog_message">正在为“%1$s”调整稀疏镜像容量。扩容操作比缩容更安全，请务必提前备份数据。</string>
-    <string name="minimum_size_4gb">最小容量为 4 GB</string>
-    <string name="enter_size_between_4_512_gb">请输入 4 至 512 GB 之间的数值</string>
+    <string name="minimum_size_gb">最小容量为 %1$d GB</string>
+    <string name="enter_size_between_gb">请输入 %1$d 至 %2$d GB 之间的数值</string>
     <string name="notification_permission_title">通知权限</string>
     <string name="use_sparse_image_description">在稀疏镜像文件中创建容器</string>
     <string name="starting_resizing">开始执行容量调整…</string>
@@ -353,7 +353,7 @@
     <string name="installation_logs">安装日志</string>
     <string name="terminal_label">终端</string>
     <string name="default_size_gb_hint">8</string>
-    <string name="size_range_4_512_hint">4-512</string>
+    <string name="size_range_hint">%1$d-%2$d</string>
     <string name="cpu_usage_label">CPU 使用率</string>
     <string name="ram_usage_label">RAM 使用率</string>
     <string name="cpu_percent_label">%1$.1f%%</string>

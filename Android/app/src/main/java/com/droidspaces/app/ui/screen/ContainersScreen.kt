@@ -602,7 +602,7 @@ private fun SparseSizeDialog(
     val context = LocalContext.current
     var sizeText by remember { mutableStateOf(initialSize.toString()) }
     val size = sizeText.toIntOrNull()
-    val isOutOfRange = size == null || size !in 4..512
+    val isOutOfRange = size == null || size !in Constants.IMAGE_SIZE_MIN_GB..Constants.IMAGE_SIZE_MAX_GB
     // The field opens pre-filled with the image's existing size, so confirming
     // straight away would run a resize that resizes nothing.
     val isSameSize = currentSize != null && size == currentSize
@@ -627,7 +627,9 @@ private fun SparseSizeDialog(
                 value = sizeText,
                 onValueChange = { if (it.isEmpty() || it.all { c -> c.isDigit() }) sizeText = it },
                 label = { Text(context.getString(R.string.size_gb)) },
-                placeholder = { Text(context.getString(R.string.size_range_4_512_hint)) },
+                placeholder = {
+                    Text(context.getString(R.string.size_range_hint, Constants.IMAGE_SIZE_MIN_GB, Constants.IMAGE_SIZE_MAX_GB))
+                },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 shape = RoundedCornerShape(16.dp),
@@ -636,7 +638,7 @@ private fun SparseSizeDialog(
                 supportingText = {
                     if (sizeText.isNotEmpty()) {
                         if (isOutOfRange) {
-                            Text(context.getString(R.string.enter_size_between_4_512_gb))
+                            Text(context.getString(R.string.enter_size_between_gb, Constants.IMAGE_SIZE_MIN_GB, Constants.IMAGE_SIZE_MAX_GB))
                         } else if (isSameSize) {
                             Text(context.getString(R.string.resize_same_as_current, currentSize))
                         }

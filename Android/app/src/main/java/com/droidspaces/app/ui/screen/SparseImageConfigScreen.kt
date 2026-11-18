@@ -74,7 +74,8 @@ fun SparseImageConfigScreen(
 
     val destinationUsable = target != null && target?.support != StorageSupport.UNUSABLE
     val directoryModeAllowed = target?.support == StorageSupport.FULL
-    val sizeValid = !useSparseImage || (sizeGB.toIntOrNull()?.let { it in 4..512 } == true)
+    val sizeValid = !useSparseImage ||
+        (sizeGB.toIntOrNull()?.let { it in Constants.IMAGE_SIZE_MIN_GB..Constants.IMAGE_SIZE_MAX_GB } == true)
 
     // A volume too small to hold a container is as much a blocker as one that cannot
     // represent it, so it gates Next the same way. Unknown free space is not treated as
@@ -103,7 +104,7 @@ fun SparseImageConfigScreen(
                 onClick = {
                     if (useSparseImage) {
                         val s = sizeGB.toIntOrNull()
-                        if (s != null && s in 4..512) onNext(true, s, storageDir)
+                        if (s != null && s in Constants.IMAGE_SIZE_MIN_GB..Constants.IMAGE_SIZE_MAX_GB) onNext(true, s, storageDir)
                     } else {
                         onNext(false, 8, storageDir)
                     }
@@ -332,8 +333,8 @@ fun SparseImageConfigScreen(
                                 sizeError = when {
                                     newValue.isEmpty() -> context.getString(R.string.size_required)
                                     sizeInt == null -> context.getString(R.string.invalid_number)
-                                    sizeInt < 4 -> context.getString(R.string.minimum_size_4gb)
-                                    sizeInt > 512 -> context.getString(R.string.maximum_size_512gb)
+                                    sizeInt < Constants.IMAGE_SIZE_MIN_GB -> context.getString(R.string.minimum_size_gb, Constants.IMAGE_SIZE_MIN_GB)
+                                    sizeInt > Constants.IMAGE_SIZE_MAX_GB -> context.getString(R.string.maximum_size_gb, Constants.IMAGE_SIZE_MAX_GB)
                                     else -> null
                                 }
                             },
@@ -341,7 +342,7 @@ fun SparseImageConfigScreen(
                             placeholder = { Text(context.getString(R.string.default_size_gb_hint)) },
                             isError = sizeError != null,
                             supportingText = sizeError?.let { { Text(it) } } ?: {
-                                Text(context.getString(R.string.enter_size_between_4_512_gb))
+                                Text(context.getString(R.string.enter_size_between_gb, Constants.IMAGE_SIZE_MIN_GB, Constants.IMAGE_SIZE_MAX_GB))
                             },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,

@@ -30,6 +30,12 @@ object Constants {
     // Minimum storage requirements
     const val MIN_STORAGE_GB = 4
 
+    // Sparse image capacity, in GB. The creation form and the resize dialog both
+    // check against these, and sparsemgr.sh accepts the same 1-512 range; they
+    // used to disagree, so the form rejected sizes the shell would have taken.
+    const val IMAGE_SIZE_MIN_GB = 1
+    const val IMAGE_SIZE_MAX_GB = 512
+
     // NAT Networking constants
     const val NAT_IP_PREFIX = "172.28"
     const val NAT_OCTET_MIN = 1

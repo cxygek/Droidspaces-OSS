@@ -432,7 +432,7 @@
     <string name="installation_logs">Installation Logs</string>
     <string name="terminal_label">Terminal</string>
     <string name="default_size_gb_hint">8</string>
-    <string name="size_range_4_512_hint">4-512</string>
+    <string name="size_range_hint">%1$d-%2$d</string>
 
     <!-- Control Panel Screen -->
     <string name="no_containers_running">No containers running</string>
@@ -570,10 +570,10 @@
     <string name="image_size">Image Size</string>
     <string name="size_required">Size is required</string>
     <string name="invalid_number">Invalid number</string>
-    <string name="minimum_size_4gb">Minimum size is 4 GB</string>
-    <string name="maximum_size_512gb">Maximum size is 512 GB</string>
+    <string name="minimum_size_gb">Minimum size is %1$d GB</string>
+    <string name="maximum_size_gb">Maximum size is %1$d GB</string>
     <string name="size_gb">Size (GB)</string>
-    <string name="enter_size_between_4_512_gb">Enter size between 4 and 512 GB</string>
+    <string name="enter_size_between_gb">Enter a size between %1$d and %2$d GB</string>
     <string name="resize_same_as_current">Already %1$d GB. Enter a different size to resize.</string>
 
     <!-- Storage location -->
