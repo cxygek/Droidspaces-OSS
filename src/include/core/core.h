@@ -86,6 +86,8 @@ extern int ds_log_container_fd;
 void ds_log_internal(const char *prefix, const char *color, int is_err,
                      const char *fmt, ...);
 void ds_die_internal(const char *fmt, ...);
+/* Stamp log lines in the phone's timezone, not UTC. */
+void ds_log_local_timezone(void);
 void rotate_log(const char *path, size_t max_size);
 
 #define ds_log(fmt, ...) ds_log_internal("+", C_GREEN, 0, fmt, ##__VA_ARGS__)

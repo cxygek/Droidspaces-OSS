@@ -20,6 +20,7 @@
 #include "droidspaces.h"
 #include <arpa/inet.h>
 #include <grp.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <stddef.h>
 #include <sys/signalfd.h>
@@ -32,36 +33,126 @@
 static FILE *g_daemon_log_fp = NULL;
 static char g_daemon_log_path[PATH_MAX] = "";
 
-/* Rotate droidspacesd.log mid-run when it exceeds the size limit.
- * Renames current log to .old, reopens fresh file, and redirects
- * stdout/stderr (background mode) or g_daemon_log_fp (foreground). */
-static void rotate_daemon_log_if_needed(void) {
-  if (g_daemon_log_path[0] == '\0')
-    return;
+/* In background mode the daemon's stdout is the log file, and everything that
+ * lands there is a terminal stream: `[` + colour + `+` + reset + `]`, carriage
+ * returns from progress lines, and not one clock reading. A pipe with a reader
+ * of our own turns that into a log: colour dropped, one timestamp per line. */
 
-  struct stat st;
-  if (stat(g_daemon_log_path, &st) < 0 || st.st_size < 4 * 1024 * 1024)
-    return;
+#define DAEMON_LOG_MAX (4 * 1024 * 1024)
 
-  char old_path[sizeof(g_daemon_log_path) + 32];
-  snprintf(old_path, sizeof(old_path), "%s.old", g_daemon_log_path);
-  rename(g_daemon_log_path, old_path);
+static FILE *g_pipe_log_fp = NULL;
+static pthread_mutex_t g_pipe_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
-  if (g_daemon_log_fp) {
-    /* foreground: reopen tee file */
-    fclose(g_daemon_log_fp);
-    g_daemon_log_fp = fopen(g_daemon_log_path, "ae");
-  } else {
-    /* background: reopen and re-dup2 stdout/stderr */
-    int lfd = open(g_daemon_log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                   0644);
-    if (lfd >= 0) {
-      dup2(lfd, STDOUT_FILENO);
-      dup2(lfd, STDERR_FILENO);
-      if (lfd > STDERR_FILENO)
-        close(lfd);
+/* Strip CSI sequences (what colour is) and carriage returns, in place. */
+static void log_clean_line(char *line) {
+  char *out = line;
+  for (const unsigned char *in = (const unsigned char *)line; *in; in++) {
+    if (*in == 0x1b && in[1] == '[') {
+      in += 2;
+      while (*in && (*in < 0x40 || *in > 0x7e))
+        in++;
+      if (!*in)
+        break;
+      continue;
+    }
+    if (*in == '\r')
+      continue;
+    *out++ = (char)*in;
+  }
+  *out = '\0';
+}
+
+static void log_stamp(char *buf, size_t size) {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  struct tm tm;
+  localtime_r(&ts.tv_sec, &tm);
+  snprintf(buf, size, "[%04d-%02d-%02d %02d:%02d:%02d.%03ld] ", tm.tm_year + 1900,
+           tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+           ts.tv_nsec / 1000000);
+}
+
+static void log_pipe_write(const char *text) {
+  char stamp[64];
+  log_stamp(stamp, sizeof(stamp));
+  pthread_mutex_lock(&g_pipe_log_lock);
+  if (g_pipe_log_fp) {
+    fprintf(g_pipe_log_fp, "%s%s\n", stamp, text);
+    /* Rotate here rather than from the accept loop: this thread owns the
+     * handle, and a rename under an open FILE would keep writing to the
+     * renamed one. */
+    if (ftell(g_pipe_log_fp) >= DAEMON_LOG_MAX) {
+      fclose(g_pipe_log_fp);
+      char old_path[sizeof(g_daemon_log_path) + 32];
+      snprintf(old_path, sizeof(old_path), "%s.old", g_daemon_log_path);
+      rename(g_daemon_log_path, old_path);
+      g_pipe_log_fp = fopen(g_daemon_log_path, "ae");
+    }
+    fflush(g_pipe_log_fp);
+  }
+  pthread_mutex_unlock(&g_pipe_log_lock);
+}
+
+static void *log_pipe_reader(void *arg) {
+  int fd = (int)(intptr_t)arg;
+  char buf[4096];
+  char line[4096];
+  size_t used = 0;
+
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n <= 0)
+      break;
+    for (ssize_t i = 0; i < n; i++) {
+      if (buf[i] != '\n') {
+        if (used + 1 < sizeof(line))
+          line[used++] = buf[i];
+        continue;
+      }
+      line[used] = '\0';
+      used = 0;
+      log_clean_line(line);
+      if (line[0])
+        log_pipe_write(line);
+    }
+    /* A line that never ends (a prompt, a progress bar) is not worth holding. */
+    if (used >= sizeof(line) - 1) {
+      line[used] = '\0';
+      used = 0;
+      log_clean_line(line);
+      if (line[0])
+        log_pipe_write(line);
     }
   }
+  return NULL;
+}
+
+/* Send stdout/stderr of the daemon, and of everything it forks, through the
+ * reader above. Called once, before the first command runs. */
+static void log_pipe_start(void) {
+  if (g_daemon_log_path[0] == '\0' || g_pipe_log_fp)
+    return;
+
+  g_pipe_log_fp = fopen(g_daemon_log_path, "ae");
+  if (!g_pipe_log_fp)
+    return;
+
+  int fds[2];
+  if (pipe(fds) < 0)
+    return;
+
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, log_pipe_reader, (void *)(intptr_t)fds[0]) != 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return;
+  }
+  pthread_detach(thread);
+
+  dup2(fds[1], STDOUT_FILENO);
+  dup2(fds[1], STDERR_FILENO);
+  if (fds[1] > STDERR_FILENO)
+    close(fds[1]);
 }
 
 /*
@@ -140,6 +231,10 @@ static void handle_conn(int conn) {
 
 /* daemonize the process: detach from terminal and protect from OOM killer */
 static void daemonize(int foreground) {
+  /* Every line the reader thread stamps uses localtime_r(); without this the
+   * stamps come out UTC on Android. */
+  ds_log_local_timezone();
+
   if (is_android()) {
     setenv(
         "PATH",
@@ -205,15 +300,10 @@ static void daemonize(int foreground) {
     rotate_log(log_path, 2 * 1024 * 1024);
 
     if (!foreground) {
-      /* Background: dup2 stdout/stderr to log file; g_daemon_log_fp stays
-       * NULL so the tee macros don't double-write. */
-      int lfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-      if (lfd >= 0) {
-        dup2(lfd, STDOUT_FILENO);
-        dup2(lfd, STDERR_FILENO);
-        if (lfd > STDERR_FILENO)
-          close(lfd);
-      }
+      /* Background: stdout and stderr go through the reader, which timestamps
+       * and de-colours every line. g_daemon_log_fp stays NULL so the tee
+       * macros do not write the same line twice. */
+      log_pipe_start();
     } else {
       /* Foreground: keep terminal live; open log file for explicit tee.
        * The daemon_log_tee() helper writes every message here alongside
@@ -418,9 +508,6 @@ int ds_daemon_run(int foreground, char **argv) {
   ds_log("Listening on @" DS_SOCK_NAME " (PID %d)", getpid());
 
   for (;;) {
-    /* Rotate log if it exceeds 4MB */
-    rotate_daemon_log_if_needed();
-
     int conn = accept4(srv, NULL, NULL, SOCK_CLOEXEC);
     if (conn < 0) {
       if (errno == EINTR || errno == EAGAIN)

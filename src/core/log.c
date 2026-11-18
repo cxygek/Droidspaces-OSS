@@ -7,6 +7,19 @@
 
 #include "droidspaces.h"
 #include <time.h>
+#include <unistd.h>
+
+/* Every timestamp in these logs is localtime_r(), and localtime_r() reads TZ
+ * only when tzset() has run first (bionic never runs it for the _r form).
+ * The daemon is a static musl binary and cannot read Android properties, so
+ * the launcher exports TZ; this makes sure it is actually picked up. */
+void ds_log_local_timezone(void) {
+  static int done = 0;
+  if (done)
+    return;
+  done = 1;
+  tzset();
+}
 
 int ds_log_silent = 0;
 char ds_log_container_name[256] = "";
@@ -35,6 +48,7 @@ void container_log_path(const char *name, const char *file, char *buf,
 
 static void write_to_log_file(const char *name, const char *component,
                               const char *raw_msg, int pre_opened_fd) {
+  ds_log_local_timezone();
   if (!name || !name[0])
     return;
 
@@ -81,6 +95,7 @@ static void write_to_log_file(const char *name, const char *component,
 
 void ds_log_internal(const char *prefix, const char *color, int is_err,
                      const char *fmt, ...) {
+  ds_log_local_timezone();
   /* A peek (ds_config_peek) at a config file prints none of the file's
    * complaints; errors are the command's own, so they still go out. */
   if (ds_log_silent == DS_LOG_PEEK && prefix[0] != '-')
@@ -108,11 +123,17 @@ void ds_log_internal(const char *prefix, const char *color, int is_err,
     return;
 
   FILE *out = is_err ? stderr : stdout;
-  fprintf(out,
-          "["
-          "%s"
-          "%s" C_RESET "] %s\r\n",
-          color, prefix, raw_msg);
+  /* Colour only a terminal can show. The daemon runs with stdout on a pipe or
+   * a file, and the module scripts redirect it to logs; escape bytes there are
+   * not decoration, they are noise every reader has to strip. */
+  if (isatty(fileno(out)))
+    fprintf(out,
+            "["
+            "%s"
+            "%s" C_RESET "] %s\r\n",
+            color, prefix, raw_msg);
+  else
+    fprintf(out, "[%s] %s\r\n", prefix, raw_msg);
   fflush(out);
 }
 
@@ -128,7 +149,10 @@ void ds_die_internal(const char *fmt, ...) {
                       ds_log_container_fd);
   }
 
-  fprintf(stderr, "[" C_RED "-" C_RESET "] %s\r\n", raw_msg);
+  if (isatty(fileno(stderr)))
+    fprintf(stderr, "[" C_RED "-" C_RESET "] %s\r\n", raw_msg);
+  else
+    fprintf(stderr, "[-] %s\r\n", raw_msg);
   fflush(stderr);
   exit(EXIT_FAILURE);
 }

@@ -64,6 +64,17 @@ if [ -f "${DAEMON_MODE_FILE}" ] && [ "$(${BUSYBOX_BINARY} cat "${DAEMON_MODE_FIL
     chcon u:object_r:droidspacesd_exec:s0 "${DROIDSPACE_BINARY}" 2>/dev/null || \
         log "WARNING: chcon failed - SELinux transition may fall back to setcon path"
 
+    # The daemon is a static musl binary: it can neither read Android
+    # properties nor open the zoneinfo file a named timezone would need
+    # (Android keeps it outside the musl search path). A POSIX offset TZ
+    # needs no file, and `date` here is the system one, which knows the
+    # rules. DST zones drift by an hour out of season; log stamps only.
+    TZ_OFFSET="$(date +%:z 2>/dev/null)"
+    case "${TZ_OFFSET}" in
+        +*) export TZ="LMT-${TZ_OFFSET#+}" ;;
+        -*) export TZ="LMT+${TZ_OFFSET#-}" ;;
+    esac
+
     if "${DROIDSPACE_BINARY}" daemon 2>&1; then
         log "Daemon process launched successfully"
     else
