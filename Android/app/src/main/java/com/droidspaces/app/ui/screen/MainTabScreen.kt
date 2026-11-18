@@ -14,9 +14,13 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Article
+import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import com.droidspaces.app.ui.component.PullToRefreshWrapper
+import com.droidspaces.app.ui.component.TerminalDialog
+import com.droidspaces.app.util.HostNetworkManager
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -53,7 +57,10 @@ private const val EASTER_EGG_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 enum class TabItem(val titleResId: Int, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
     Home(R.string.home_title, Icons.Default.Home),
     Containers(R.string.containers, DsIcons.Logo),
-    ControlPanel(R.string.panel, Icons.Default.Dashboard)
+    ControlPanel(R.string.panel, Icons.Default.Dashboard),
+    /* The phone's own side of the container network: its LAN membership and
+     * the ports it forwards in. Host-level, so it is not under Containers. */
+    Network(R.string.network_title, Icons.Default.Lan)
 }
 
 /**
@@ -104,6 +111,10 @@ fun MainTabScreen(
 
     // Track which container has its action drawer expanded (hoisted for global collapse)
     var expandedContainerName by rememberSaveable { mutableStateOf<String?>(null) }
+    // The network tab's console is opened from the top bar, like every other
+    // log in the app: a text button at the bottom of a scrolling page scrolls
+    // away from what it describes.
+    var showNetworkLogs by remember { mutableStateOf(false) }
 
     // Handle back press - return to Home tab if not already there
     BackHandler(enabled = selectedTab != TabItem.Home) {
@@ -191,6 +202,10 @@ fun MainTabScreen(
                     // Home/Containers: Always run a full scan on refresh for maximum visibility
                     containerViewModel.scan(showIndicator = true)
                 }
+                TabItem.Network -> {
+                    // The tab reads kernel and lease state when it composes;
+                    // there is no cached list to refresh.
+                }
                 TabItem.ControlPanel -> {
                     // Control Panel: snappy refresh, but background recovery
                     val rawList = withContext(Dispatchers.IO) {
@@ -243,6 +258,15 @@ fun MainTabScreen(
                     }
                 },
                 actions = {
+                    if (selectedTab == TabItem.Network) {
+                        IconButton(onClick = { showNetworkLogs = true }) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.Article,
+                                contentDescription = context.getString(R.string.view_logs),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
                     IconButton(onClick = onNavigateToSettings) {
                         Icon(imageVector = Icons.Default.Settings, contentDescription = context.getString(R.string.settings))
                     }
@@ -309,6 +333,15 @@ fun MainTabScreen(
                         }
                     }
 
+                    TabItem.Network -> {
+                        PullToRefreshWrapper(onRefresh = { performRefresh(TabItem.Network) }) {
+                            NetworkScreen(
+                                modifier = Modifier.fillMaxSize(),
+                                bottomBarInset = bottomBarHeight
+                            )
+                        }
+                    }
+
                     TabItem.ControlPanel -> {
                         PullToRefreshWrapper(onRefresh = { performRefresh(TabItem.ControlPanel) }) {
                             ControlPanelScreen(
@@ -343,6 +376,15 @@ fun MainTabScreen(
                 )
             }
         }
+    }
+
+    if (showNetworkLogs) {
+        TerminalDialog(
+            title = context.getString(R.string.network_title),
+            logs = HostNetworkManager.logs.toList(),
+            onDismiss = { showNetworkLogs = false },
+            onClear = { HostNetworkManager.clearLogs() }
+        )
     }
 }
 
@@ -577,6 +619,7 @@ private fun MainBottomBar(
             Spacer(modifier = Modifier.navigationBarsPadding())
         }
     }
+
 }
 
 /** The home card's view of the backend; null for Checking, which keeps the last one. */

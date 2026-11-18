@@ -13,6 +13,12 @@ object Constants {
     const val BUSYBOX_BINARY_PATH = "$INSTALL_PATH/$BUSYBOX_BINARY_NAME"
     const val MAGISK_MODULE_PATH = "/data/adb/modules/droidspaces"
 
+    // Workspace and host-level networking
+    const val WORKSPACE_PATH = "/data/local/Droidspaces"
+    /* iptables on Android takes -w when its xtables lock exists, and errors on
+     * the flag when it does not; the probe in HostNetworkManager picks one. */
+    var IPTABLES_WAIT = ""
+
     // Container paths
     const val CONTAINERS_BASE_PATH = "/data/local/Droidspaces/Containers"
     const val MODULE_SYSTEM_BIN_PATH = "$MAGISK_MODULE_PATH/system/bin"
