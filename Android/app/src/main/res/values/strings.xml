@@ -786,6 +786,9 @@
     <string name="port_forward_no_ip">no address</string>
     <string name="port_forward_host_port">Phone port</string>
     <string name="port_forward_container_port">Container port</string>
+    <string name="port_forward_note">Note (optional)</string>
+    <string name="forward_edit">Edit rule</string>
+    <string name="forward_edit_intro">Change the ports, target or note. The rule is replaced in the kernel.</string>
     <string name="port_forward_bad_port">Ports must be between 1 and 65535.</string>
     <string name="port_forward_span_mismatch">A target span must be as long as the phone span.</string>
     <string name="forward_sort_port">Port order</string>

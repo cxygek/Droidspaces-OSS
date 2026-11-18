@@ -704,6 +704,9 @@
     <string name="port_forward_no_ip">无地址</string>
     <string name="port_forward_host_port">手机端口</string>
     <string name="port_forward_container_port">容器端口</string>
+    <string name="port_forward_note">备注（可选）</string>
+    <string name="forward_edit">编辑规则</string>
+    <string name="forward_edit_intro">可以修改端口、目标容器和备注，规则会在内核里替换。</string>
     <string name="port_forward_bad_port">端口需在 1-65535 之间。</string>
     <string name="port_forward_span_mismatch">容器端口段的长度需与手机端口段一致。</string>
     <string name="forward_sort_port">按端口</string>

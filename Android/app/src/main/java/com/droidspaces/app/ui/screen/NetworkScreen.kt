@@ -16,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.Icon
@@ -38,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.KeyboardOptions
@@ -81,6 +83,7 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
     var busyLan by remember { mutableStateOf(false) }
     var busyForwarding by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<HostForward?>(null) }
     var forwardSort by remember { mutableStateOf(ForwardSort.PORT) }
     var chosenBridge by remember { mutableStateOf<String?>(null) }
     var notice by remember { mutableStateOf<String?>(null) }
@@ -164,6 +167,7 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
                     refresh()
                 }
             },
+            onEdit = { rule -> editing = rule },
             onToggle = { want ->
                 scope.launch {
                     busyForwarding = true
@@ -184,8 +188,31 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         Spacer(Modifier.height(12.dp))
     }
 
+    editing?.let { rule ->
+        /* A stopped container is not in the running list, but its rule still
+         * has a name and an address. Keep it selectable so the whole rule can
+         * be edited, not only the ports of a live container. */
+        val targets = if (running.any { it.name == rule.container }) running
+                      else running + RunningContainer(rule.container, rule.containerIp)
+        ForwardDialog(
+            containers = targets,
+            initial = rule,
+            onDismiss = { editing = null },
+            onConfirm = { updated ->
+                editing = null
+                scope.launch {
+                    if (!HostNetworkManager.updateForward(rule, updated, status?.subnet))
+                        notice = context.getString(R.string.port_forward_failed)
+                    else
+                        HostNetworkManager.syncGatewayRoute(status, running)
+                    refresh()
+                }
+            }
+        )
+    }
+
     if (adding) {
-        AddForwardDialog(
+        ForwardDialog(
             containers = running,
             onDismiss = { adding = false },
             onConfirm = { rule ->
@@ -305,6 +332,7 @@ private fun ForwardingCard(
     onSort: (ForwardSort) -> Unit,
     onAdd: () -> Unit,
     onDelete: (HostForward) -> Unit,
+    onEdit: (HostForward) -> Unit,
     onToggle: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
@@ -368,7 +396,12 @@ private fun ForwardingCard(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     entries.forEach { entry ->
-                        ForwardRow(entry) { onDelete(entry.rule) }
+                        ForwardRow(
+                            entry,
+                            sort = sort,
+                            onDelete = { onDelete(entry.rule) },
+                            onEdit = { onEdit(entry.rule) },
+                        )
                     }
                 }
             }
@@ -419,8 +452,26 @@ private fun bridgeLabel(context: android.content.Context, bridge: LanBridge): St
     "${bridge.name}  ·  " + context.getString(R.string.host_lan_members, bridge.members)
 
 @Composable
-private fun ForwardRow(entry: ForwardStatus, onDelete: () -> Unit) {
+private fun ForwardRow(
+    entry: ForwardStatus,
+    sort: ForwardSort,
+    onDelete: () -> Unit,
+    onEdit: () -> Unit,
+) {
     val context = LocalContext.current
+    val rule = entry.rule
+    /* What the list is sorted by is what the eye is scanning for, so that
+     * field leads the row. The note names the service when there is one;
+     * otherwise the other end of the rule keeps the line useful. */
+    val title = when (sort) {
+        ForwardSort.PORT -> rule.hostLabel
+        ForwardSort.CONTAINER -> rule.container
+    }
+    val beside = when {
+        rule.note.isNotBlank() -> rule.note
+        sort == ForwardSort.PORT -> rule.container
+        else -> rule.hostLabel
+    }
     val (label, color) = when (entry.state) {
         ForwardState.ACTIVE ->
             context.getString(R.string.forward_state_active) to MaterialTheme.colorScheme.primary
@@ -429,8 +480,10 @@ private fun ForwardRow(entry: ForwardStatus, onDelete: () -> Unit) {
         ForwardState.DRIFTED ->
             context.getString(R.string.forward_state_drifted) to MaterialTheme.colorScheme.error
         ForwardState.STOPPED ->
-            context.getString(R.string.forward_state_stopped) to MaterialTheme.colorScheme.onSurfaceVariant
+            context.getString(R.string.forward_state_stopped) to
+                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
     }
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -439,43 +492,93 @@ private fun ForwardRow(entry: ForwardStatus, onDelete: () -> Unit) {
         tonalElevation = 0.dp
     ) {
         Row(
-            modifier = Modifier.padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.Top
         ) {
-            Column(Modifier.weight(1f)) {
+            /* Every line is capped at one line: a port span, a long container
+             * name and a stopped state together used to wrap into a stack of
+             * half-lines that was hard to scan. */
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        title,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1
+                    )
+                    Text("·", style = MaterialTheme.typography.bodyMedium, color = secondary)
+                    Text(
+                        beside,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = secondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
                 Text(
-                    "${entry.rule.hostLabel} → ${entry.rule.container}:${entry.rule.containerLabel}",
-                    style = MaterialTheme.typography.bodyLarge
+                    "${rule.hostLabel} → ${rule.targetLabel}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = secondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    "${entry.rule.proto}  ·  ${entry.rule.containerIp}  ·  $label",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = color
+                    "${rule.proto}  ·  ${rule.containerIp}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
-            IconButton(onClick = onDelete) {
-                Icon(
-                    Icons.Default.Delete,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
-                    tint = MaterialTheme.colorScheme.error
-                )
+            Column(horizontalAlignment = Alignment.End) {
+                Text(label, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1)
+                Spacer(Modifier.height(4.dp))
+                Row {
+                    IconButton(onClick = onEdit, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            Icons.Default.Edit,
+                            contentDescription = context.getString(R.string.forward_edit),
+                            modifier = Modifier.size(18.dp),
+                            tint = secondary
+                        )
+                    }
+                    IconButton(onClick = onDelete, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-private fun AddForwardDialog(
+private fun ForwardDialog(
     containers: List<RunningContainer>,
     onDismiss: () -> Unit,
     onConfirm: (HostForward) -> Unit,
+    initial: HostForward? = null,
 ) {
     val context = LocalContext.current
-    var target by remember { mutableStateOf(containers.firstOrNull()) }
-    var hostPort by remember { mutableStateOf("") }
-    var containerPort by remember { mutableStateOf("") }
-    var proto by remember { mutableStateOf("tcp") }
+    var target by remember {
+        mutableStateOf(initial?.let { r -> containers.firstOrNull { it.name == r.container } }
+            ?: containers.firstOrNull())
+    }
+    var hostPort by remember { mutableStateOf(initial?.hostLabel.orEmpty()) }
+    var containerPort by remember { mutableStateOf(initial?.containerLabel.orEmpty()) }
+    var proto by remember { mutableStateOf(initial?.proto ?: "tcp") }
+    var note by remember { mutableStateOf(initial?.note.orEmpty()) }
 
     /* "8080" or "2000-2010" → (first port, how many), null when it is neither.
      * A span is capped where the field stops being readable; one rule per port
@@ -507,7 +610,9 @@ private fun AddForwardDialog(
         footer = {
             DialogFooterRow(
                 dismissLabel = context.getString(R.string.cancel),
-                confirmLabel = context.getString(R.string.add),
+                confirmLabel = context.getString(
+                    if (initial == null) R.string.add else R.string.save_changes
+                ),
                 onDismiss = onDismiss,
                 onConfirm = {
                     val t = target ?: return@DialogFooterRow
@@ -524,6 +629,7 @@ private fun AddForwardDialog(
                             containerIp = t.ip,
                             containerPort = targetPorts.first,
                             count = host.second,
+                            note = note,
                         )
                     )
                 },
@@ -532,12 +638,16 @@ private fun AddForwardDialog(
         }
     ) {
         Text(
-            context.getString(R.string.port_forward_add),
+            context.getString(
+                if (initial == null) R.string.port_forward_add else R.string.forward_edit
+            ),
             fontWeight = FontWeight.Bold,
             style = MaterialTheme.typography.titleLarge
         )
         Text(
-            context.getString(R.string.port_forward_add_intro),
+            context.getString(
+                if (initial == null) R.string.port_forward_add_intro else R.string.forward_edit_intro
+            ),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -594,6 +704,8 @@ private fun AddForwardDialog(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
         )
 
+        NoteField(note) { note = it }
+
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("tcp", "udp").forEach { p ->
                 val selected = proto == p
@@ -624,4 +736,21 @@ private fun AddForwardDialog(
             )
         }
     }
+}
+
+@Composable
+private fun NoteField(note: String, onNoteChange: (String) -> Unit) {
+    val context = LocalContext.current
+    OutlinedTextField(
+        value = note,
+        onValueChange = { text ->
+            if (text.length <= 80 && '|' !in text && '\n' !in text)
+                onNoteChange(text)
+        },
+        label = { Text(context.getString(R.string.port_forward_note)) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        colors = DsTextFieldDefaults.colors()
+    )
 }

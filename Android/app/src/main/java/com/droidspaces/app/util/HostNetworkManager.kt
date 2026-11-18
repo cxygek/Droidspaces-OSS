@@ -55,6 +55,8 @@ data class HostForward(
     val containerPort: Int,
     /** How many ports the rule covers, one by default. 2000-2010 is 11. */
     val count: Int = 1,
+    /** A human's label for the service behind the rule. Never reaches iptables. */
+    val note: String = "",
 ) {
     val hostLast: Int get() = hostPort + count - 1
     val containerLast: Int get() = containerPort + count - 1
@@ -64,6 +66,10 @@ data class HostForward(
 
     val containerLabel: String
         get() = if (count <= 1) "$containerPort" else "$containerPort-$containerLast"
+
+    /** Same ports on both sides need no second port number in the list. */
+    val targetLabel: String
+        get() = if (containerLabel == hostLabel) container else "$container:$containerLabel"
 }
 
 /**
@@ -385,7 +391,8 @@ object HostNetworkManager {
             val trimmed = line.trim()
             if (trimmed.isEmpty() || trimmed.startsWith("#")) return@mapNotNull null
             val parts = trimmed.split('|')
-            if (parts.size != 5) return@mapNotNull null
+            // Five fields is an old rule written before notes existed.
+            if (parts.size !in 5..6) return@mapNotNull null
             val host = portSpan(parts[1]) ?: return@mapNotNull null
             val container = portSpan(parts[4]) ?: return@mapNotNull null
             /* Both sides move together: one host port per container port. A
@@ -397,6 +404,7 @@ object HostNetworkManager {
                 containerIp = parts[3],
                 containerPort = container.first,
                 count = host.second,
+                note = parts.getOrNull(5).orEmpty(),
             )
         }
 
@@ -414,11 +422,17 @@ object HostNetworkManager {
         return from to (to - from + 1)
     }
 
+    /** Keep a note to one line and out of the field separator. */
+    private fun noteField(text: String): String =
+        text.trim().replace('|', ' ').replace('\n', ' ').replace('\r', ' ')
+
     private suspend fun writeForwards(rules: List<HostForward>): Boolean {
         val lines = buildList {
-            add("# Host port forwards, one per line: proto|host|container|ip|port")
+            add("# Host port forwards, one per line: proto|host|container|ip|port[|note]")
             rules.forEach {
-                add("${it.proto}|${it.hostLabel}|${it.container}|${it.containerIp}|${it.containerLabel}")
+                val note = noteField(it.note)
+                val suffix = if (note.isEmpty()) "" else "|$note"
+                add("${it.proto}|${it.hostLabel}|${it.container}|${it.containerIp}|${it.containerLabel}$suffix")
             }
         }
         return writeRootFile(FORWARDS_PATH, lines.joinToString("\n"))
@@ -499,6 +513,40 @@ object HostNetworkManager {
         val rest = listForwards().filterNot { it.hostPort == rule.hostPort && it.proto == rule.proto }
         if (!writeForwards(rest + rule)) {
             fail("The rule is in the kernel but could not be saved.")
+            return@runCatching false
+        }
+        info("Rule saved.")
+        true
+    }.getOrDefault(false)
+
+    /**
+     * Replace a rule in the kernel and in the file. The old one is removed
+     * first so an edit that only changes the target still fits: two DNATs for
+     * the same host port would fight over the packet.
+     */
+    suspend fun updateForward(
+        old: HostForward,
+        updated: HostForward,
+        subnet: String?,
+    ): Boolean = runCatching {
+        info("Editing ${old.hostLabel} → ${old.container}:${old.containerLabel}")
+        uninstall(old)
+        if (!install(updated, subnet)) {
+            uninstall(updated)
+            install(old, subnet)
+            fail("iptables refused the edited rule.")
+            return@runCatching false
+        }
+        val rest = listForwards()
+            .filterNot {
+                it.hostPort == old.hostPort && it.proto == old.proto &&
+                    it.containerIp == old.containerIp
+            }
+            .filterNot { it.hostPort == updated.hostPort && it.proto == updated.proto }
+        if (!writeForwards(rest + updated)) {
+            uninstall(updated)
+            install(old, subnet)
+            fail("The edited rule could not be saved.")
             return@runCatching false
         }
         info("Rule saved.")
