@@ -53,7 +53,7 @@ data class HostForward(
     val container: String,
     val containerIp: String,
     val containerPort: Int,
-    /** How many ports the rule covers, one by default. 2000-2010 is 11. */
+    /** How many ports the rule covers, one by default. 2000:2010 is 11. */
     val count: Int = 1,
     /** A human's label for the service behind the rule. Never reaches iptables. */
     val note: String = "",
@@ -61,10 +61,15 @@ data class HostForward(
     val hostLast: Int get() = hostPort + count - 1
     val containerLast: Int get() = containerPort + count - 1
 
+    /** iptables spells a port range with a colon on the match side. */
     val hostLabel: String
-        get() = if (count <= 1) "$hostPort" else "$hostPort-$hostLast"
+        get() = if (count <= 1) "$hostPort" else "$hostPort:$hostLast"
 
     val containerLabel: String
+        get() = if (count <= 1) "$containerPort" else "$containerPort:$containerLast"
+
+    /** DNAT takes the destination range with a hyphen instead. */
+    val containerDest: String
         get() = if (count <= 1) "$containerPort" else "$containerPort-$containerLast"
 
     /** Same ports on both sides need no second port number in the list. */
@@ -95,6 +100,18 @@ data class RunningContainer(
     fun sameSubnet(address: String): Boolean =
         ip.isEmpty() || address.isEmpty() ||
             address.substringBeforeLast('.') == ip.substringBeforeLast('.')
+}
+
+/** What the boot script and the gateway's static lease agree on. */
+data class AutoBootNetwork(
+    val enabled: Boolean = true,
+    val ip: String = "",
+    val hostname: String = "",
+    val mac: String = "",
+    val gateway: String = "",
+    val subnet: String = "",
+) {
+    val staticConfigured: Boolean get() = ip.isNotBlank() && mac.isNotBlank() && subnet.isNotBlank()
 }
 
 /** Whether a saved rule is actually doing anything right now. */
@@ -130,7 +147,9 @@ data class ForwardStatus(val rule: HostForward, val state: ForwardState)
 object HostNetworkManager {
     private const val CHAIN_NAT = "DSPF_NAT"
     private const val CHAIN_FWD = "DSPF_FWD"
+    private const val CHAIN_LOCAL = "DSPF_LOCAL"
     private const val TAG = "dspaces:net"
+    private const val AUTOBOOT_PATH = "${Constants.WORKSPACE_PATH}/Net/autoboot.conf"
     private const val FORWARDS_PATH = "${Constants.WORKSPACE_PATH}/Net/forwards.conf"
     private const val SWITCH_PATH = "${Constants.WORKSPACE_PATH}/Net/forwarding.conf"
     private const val ROUTE_PATH = "${Constants.WORKSPACE_PATH}/Net/route.conf"
@@ -242,6 +261,28 @@ object HostNetworkManager {
         return ok
     }
 
+    private fun gatewayFor(
+        st: HostLanStatus,
+        containers: List<RunningContainer>,
+    ): RunningContainer? =
+        containers.firstOrNull { it.addresses.contains(st.gateway) }
+            ?: containers.firstOrNull { it.ip == st.gateway }
+
+    /** The client network the phone is on, or null on mobile data. */
+    private suspend fun uplinkSubnet(): String? {
+        val dev = Regex("dev (\\S+)")
+            .find(shOut("ip route get 8.8.8.8 2>/dev/null").joinToString(" "))
+            ?.groupValues?.get(1) ?: return null
+        if (dev.startsWith("rmnet") || dev.startsWith("ccmni") || dev.startsWith("pdp"))
+            return null
+        val cidr = shOut("ip -4 -o addr show dev $dev 2>/dev/null")
+            .firstOrNull()
+            ?.split(Regex("\\s+"))
+            ?.let { tokens -> tokens.getOrNull(tokens.indexOf("inet") + 1) }
+            ?: return null
+        return networkCidr(cidr)
+    }
+
     /**
      * Gives the gateway a way back to the network the forwarded connections come
      * from. Without it a container answers through the phone's NAT bridge, whose
@@ -259,35 +300,12 @@ object HostNetworkManager {
         if (!st.hasAddress || st.gateway.isBlank() || st.gateway == "0.0.0.0")
             return@runCatching false
 
-        // Match on every address the container holds: the preferred one is the
-        // LAN address only when the caller knew the LAN prefix, and the gateway
-        // is also the container that owns the bridge's NAT side.
-        val gateway = containers.firstOrNull { it.addresses.contains(st.gateway) }
-            ?: containers.firstOrNull { it.ip == st.gateway }
+        val gateway = gatewayFor(st, containers)
         if (gateway == null) {
             warn("No container holds ${st.gateway}; the return route is not in place.")
             return@runCatching false
         }
-
-        // The subnet we forward from is the one the uplink sits on.
-        val dev = Regex("dev (\\S+)")
-            .find(shOut("ip route get 8.8.8.8 2>/dev/null").joinToString(" "))
-            ?.groupValues?.get(1)
-        if (dev == null) {
-            warn("No uplink found; the gateway cannot return to the client network.")
-            return@runCatching false
-        }
-        if (dev.startsWith("rmnet") || dev.startsWith("ccmni") || dev.startsWith("pdp")) {
-            info("Uplink is $dev (mobile data); no return route is useful there.")
-            return@runCatching true
-        }
-
-        val cidr = shOut("ip -4 -o addr show dev $dev 2>/dev/null")
-            .firstOrNull()
-            ?.split(Regex("\\s+"))
-            ?.let { tokens -> tokens.getOrNull(tokens.indexOf("inet") + 1) }
-            ?: return@runCatching false
-        val subnet = networkCidr(cidr) ?: return@runCatching false
+        val subnet = uplinkSubnet() ?: return@runCatching false
 
         /* What we last told this gateway. Running a command inside a container
          * costs the better part of a second, and the answer only changes when
@@ -310,6 +328,166 @@ object HostNetworkManager {
         info("${gateway.name}: $subnet via ${st.ip}")
         true
     }.getOrDefault(false)
+
+    suspend fun autoBootConfig(): AutoBootNetwork {
+        val values = readRootFile(AUTOBOOT_PATH)
+            .mapNotNull { line ->
+                val key = line.substringBefore('=', "")
+                if (key.isBlank()) null
+                else key to line.substringAfter('=', "").trim()
+            }
+            .toMap()
+        return AutoBootNetwork(
+            enabled = values["enabled"] != "0",
+            ip = values["ip"].orEmpty(),
+            hostname = values["hostname"].orEmpty(),
+            mac = values["mac"].orEmpty(),
+            gateway = values["gateway"].orEmpty(),
+            subnet = values["subnet"].orEmpty(),
+        )
+    }
+
+    /** dnsmasq rejects a hostname with spaces, which stops DHCP altogether. */
+    private fun validHostname(text: String): Boolean =
+        text.isBlank() || text.matches(Regex("[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"))
+
+    private fun validIpv4(text: String): Boolean {
+        val octets = text.split('.')
+        return octets.size == 4 && octets.all {
+            it.isNotEmpty() && it.all { ch -> ch.isDigit() } &&
+                it.toIntOrNull() in 0..255
+        }
+    }
+
+    private suspend fun hostMac(iface: String): String? =
+        shOut("cat /sys/class/net/${ContainerCommandBuilder.quote(iface)}/address 2>/dev/null")
+            .firstOrNull()?.trim()?.takeIf { it.matches(Regex("[0-9a-fA-F:]{17}")) }
+
+    enum class ReturnRouteState { READY, NOT_NEEDED, NO_LAN, NO_GATEWAY, MISSING }
+
+    /**
+     * Whether the gateway can answer connections the phone forwards into its
+     * LAN. A rule in the kernel means nothing without this route, so the card
+     * says so instead of showing a rule as active but unreachable.
+     */
+    suspend fun returnRouteState(
+        status: HostLanStatus?,
+        containers: List<RunningContainer>,
+    ): ReturnRouteState {
+        val st = status ?: return ReturnRouteState.NO_LAN
+        if (!st.hasAddress)
+            return ReturnRouteState.NO_LAN
+        val gateway = gatewayFor(st, containers) ?: return ReturnRouteState.NO_GATEWAY
+        // Mobile data has no client network to return to.
+        val subnet = uplinkSubnet() ?: return ReturnRouteState.NOT_NEEDED
+        val record = "gw=${gateway.name} pid=${gateway.pid} via=${st.ip} subnet=$subnet"
+        return if (readRootFile(ROUTE_PATH).any { it.trim() == record })
+            ReturnRouteState.READY
+        else
+            ReturnRouteState.MISSING
+    }
+
+    /** Only the boot switch. Static lease settings live in the LAN card. */
+    suspend fun setAutoBootEnabled(enabled: Boolean): Boolean = runCatching {
+        val current = autoBootConfig()
+        val saved = buildList {
+            add("enabled=${if (enabled) 1 else 0}")
+            add("ip=${current.ip}")
+            add("hostname=${current.hostname}")
+            add("mac=${current.mac}")
+            add("gateway=${current.gateway}")
+            add("subnet=${current.subnet}")
+        }
+        val ok = writeRootFile(AUTOBOOT_PATH, saved.joinToString("\n"))
+        if (ok)
+            info(if (enabled) "Boot network restore is on." else "Boot network restore is off.")
+        ok
+    }.getOrDefault(false)
+
+    /**
+     * Make the gateway's DHCP server always hand the host the same address,
+     * and give it a route back to the client network. Both fields blank clears
+     * the named UCI sections again.
+     */
+    suspend fun setStaticNetwork(ipInput: String, hostnameInput: String): Boolean =
+        runCatching {
+            val st = status()
+            if (st?.hasAddress != true) {
+                fail("Join the container LAN before setting this up.")
+                return@runCatching false
+            }
+            val containers = runningContainers(st.ip.substringBeforeLast('.') + ".")
+            val gateway = gatewayFor(st, containers)
+            if (gateway == null) {
+                fail("No gateway container is holding ${st.gateway}.")
+                return@runCatching false
+            }
+
+            val current = autoBootConfig()
+            val hostname = hostnameInput.trim()
+            val clear = ipInput.isBlank() && hostname.isBlank()
+            val ip = if (clear) "" else ipInput.trim().ifBlank { current.ip.ifBlank { st.ip } }
+            if (!clear && !validIpv4(ip)) {
+                fail("Use a valid IPv4 address for the static lease.")
+                return@runCatching false
+            }
+            if (!clear && !validHostname(hostname)) {
+                fail("Hostname may only use letters, digits and hyphens.")
+                return@runCatching false
+            }
+
+            val mac = current.mac.ifBlank { hostMac(st.iface).orEmpty() }
+            val subnet = current.subnet.ifBlank { uplinkSubnet().orEmpty() }
+            if (!clear && (mac.isBlank() || subnet.isBlank())) {
+                fail("Could not read the host MAC or the client subnet.")
+                return@runCatching false
+            }
+
+            val q = { text: String -> ContainerCommandBuilder.quote(text) }
+            val inner = buildString {
+                if (clear) {
+                    append("uci -q delete dhcp.ds_host; ")
+                    append("uci -q delete network.ds_route; ")
+                } else {
+                    append("uci set dhcp.ds_host=host && ")
+                    append("uci set dhcp.ds_host.mac=${q(mac)} && ")
+                    append("uci set dhcp.ds_host.ip=${q(ip)} && ")
+                    if (hostname.isBlank())
+                        append("uci -q delete dhcp.ds_host.name 2>/dev/null || :; ")
+                    else
+                        append("uci set dhcp.ds_host.name=${q(hostname)} && ")
+                    append("uci set network.ds_route=route && ")
+                    append("uci set network.ds_route.target=${q(subnet)} && ")
+                    append("uci set network.ds_route.gateway=${q(ip)} && ")
+                    append("uci set network.ds_route.interface=lan && ")
+                }
+                append("uci commit dhcp && uci commit network && ")
+                append("/etc/init.d/network reload >/dev/null 2>&1; ")
+                append("/etc/init.d/dnsmasq restart >/dev/null 2>&1")
+            }
+            val cmd = "${Constants.DROIDSPACES_BINARY_PATH} -n ${q(gateway.name)} " +
+                "run -- sh -c ${q(inner)}"
+            if (!sh("$cmd 2>&1").isSuccess) {
+                fail(if (clear) "Could not remove the static lease."
+                     else "Could not save the gateway's static lease.")
+                return@runCatching false
+            }
+
+            val saved = buildList {
+                add("enabled=${if (current.enabled) 1 else 0}")
+                add("ip=$ip")
+                add("hostname=$hostname")
+                add("mac=${if (clear) "" else mac}")
+                add("gateway=${if (clear) "" else gateway.name}")
+                add("subnet=${if (clear) "" else subnet}")
+            }
+            if (!writeRootFile(AUTOBOOT_PATH, saved.joinToString("\n"))) {
+                fail("Gateway updated, but the setting could not be saved.")
+                return@runCatching false
+            }
+            info(if (clear) "Static network config cleared." else "Static network config saved.")
+            true
+        }.getOrDefault(false)
 
     /** "192.168.124.111/24" → "192.168.124.0/24", or null when it is not IPv4. */
     private fun networkCidr(cidr: String): String? {
@@ -408,14 +586,14 @@ object HostNetworkManager {
             )
         }
 
-    /** "8080" or "2000-2010" to (first, count), null when it is neither. */
+    /** "8080" or "2000:2010" to (first, count). Old hyphen spans still load. */
     private fun portSpan(text: String): Pair<Int, Int>? {
         val trimmed = text.trim()
-        if ('-' !in trimmed) {
+        if (':' !in trimmed && '-' !in trimmed) {
             val port = trimmed.toIntOrNull() ?: return null
             return if (port in 1..65535) port to 1 else null
         }
-        val bounds = trimmed.split('-', limit = 2)
+        val bounds = trimmed.split(':', '-', limit = 2)
         val from = bounds[0].toIntOrNull() ?: return null
         val to = bounds.getOrNull(1)?.toIntOrNull() ?: return null
         if (from !in 1..65535 || to !in from..65535) return null
@@ -444,39 +622,48 @@ object HostNetworkManager {
      * container looks identical in the file, and only the chains know.
      */
     /** Our rules as they exist right now, in one shell call. */
-    private suspend fun chainLines(): Pair<List<String>, List<String>> {
+    private suspend fun chainLines(): Triple<List<String>, List<String>, List<String>> {
         val wait = waitFlag()
         val dump = shOut(
             "iptables $wait -t nat -S $CHAIN_NAT 2>/dev/null; echo @@; " +
-                "iptables $wait -S $CHAIN_FWD 2>/dev/null"
+                "iptables $wait -S $CHAIN_FWD 2>/dev/null; echo @@; " +
+                "iptables $wait -t nat -S $CHAIN_LOCAL 2>/dev/null"
         )
-        val split = dump.indexOf("@@")
-        val nat = (if (split >= 0) dump.subList(0, split) else dump).filter { it.contains(TAG) }
-        val forward = (if (split >= 0) dump.drop(split + 1) else emptyList())
-            .filter { it.contains(TAG) }
-        return nat to forward
+        val marks = dump.mapIndexedNotNull { i, line -> if (line.trim() == "@@") i else null }
+        val first = marks.getOrNull(0) ?: dump.size
+        val second = marks.getOrNull(1) ?: dump.size
+        val own = { lines: List<String> -> lines.filter { it.contains(TAG) } }
+        return Triple(
+            own(dump.subList(0, first)),
+            own(dump.subList(minOf(first + 1, dump.size), minOf(second, dump.size))),
+            own(dump.drop(minOf(second + 1, dump.size))),
+        )
     }
 
-    /** Every port in the rule, one line per port, is what the kernel holds. */
     private fun hasRedirect(nat: List<String>, rule: HostForward): Boolean =
-        (0 until rule.count).all { offset ->
-            val host = rule.hostPort + offset
-            val inside = rule.containerPort + offset
-            nat.any { line ->
-                line.contains("-p ${rule.proto}") &&
-                    line.contains("--dport $host ") &&
-                    line.contains("--to-destination ${rule.containerIp}:$inside")
-            }
+        nat.any { line ->
+            line.contains("-p ${rule.proto}") &&
+                line.contains("--dport ${rule.hostLabel} ") &&
+                line.contains("--to-destination ${rule.containerIp}:${rule.containerDest}")
         }
 
     private fun hasAccept(forward: List<String>, rule: HostForward): Boolean =
-        (0 until rule.count).all { offset ->
-            val inside = rule.containerPort + offset
-            forward.any { line ->
-                line.contains("-d ${rule.containerIp}") &&
-                    line.contains("--dport $inside ") &&
-                    line.contains("-j ACCEPT")
-            }
+        forward.any { line ->
+            line.contains("-d ${rule.containerIp}") &&
+                line.contains("--dport ${rule.containerLabel} ") &&
+                line.contains("-j ACCEPT")
+        }
+
+    /* The browser on the phone sends to its own LAN address, which never
+     * passes PREROUTING. OUTPUT needs the same DNAT, but only for addresses
+     * that are actually local and not loopback: a loopback destination would
+     * make the container reply to 127.0.0.1 and the connection would hang. */
+    private fun hasLocal(local: List<String>, rule: HostForward): Boolean =
+        local.any { line ->
+            line.contains("--dst-type LOCAL") &&
+                line.contains("-p ${rule.proto}") &&
+                line.contains("--dport ${rule.hostLabel} ") &&
+                line.contains("--to-destination ${rule.containerIp}:${rule.containerDest}")
         }
 
     suspend fun forwardStates(
@@ -485,7 +672,7 @@ object HostNetworkManager {
         forwardingOn: Boolean,
     ): List<ForwardStatus> {
         if (rules.isEmpty()) return emptyList()
-        val (nat, forward) = chainLines()
+        val (nat, forward, _) = chainLines()
         return rules.map { rule ->
             val live = containers.firstOrNull { it.name == rule.container }
             /* The switch decides first: with forwarding off there is nothing in
@@ -572,8 +759,8 @@ object HostNetworkManager {
      */
     suspend fun applyAll(): Boolean = runCatching {
         if (!forwardingEnabled()) {
-            val (nat, forward) = chainLines()
-            if (nat.isEmpty() && forward.isEmpty()) {
+            val (nat, forward, local) = chainLines()
+            if (nat.isEmpty() && forward.isEmpty() && local.isEmpty()) {
                 info("Forwarding is off; no rules in the kernel.")
                 return@runCatching false
             }
@@ -601,12 +788,11 @@ object HostNetworkManager {
         /* Read before writing: on a phone that has not rebooted the kernel
          * already matches the file, and re-installing is a dozen root shells
          * the user would wait through every time the tab opens. */
-        val (nat, forward) = chainLines()
-        // A span writes one chain line per port, so the counts to match are
-        // the ports, not the rules.
-        val ports = followed.sumOf { it.count }
-        val upToDate = followed.all { hasRedirect(nat, it) && hasAccept(forward, it) } &&
-            nat.size == ports && forward.size == ports
+        val (nat, forward, local) = chainLines()
+        val upToDate = followed.all {
+            hasRedirect(nat, it) && hasAccept(forward, it) && hasLocal(local, it)
+        } && nat.size == followed.size && forward.size == followed.size &&
+            local.size == followed.size
         if (upToDate) {
             if (followed.isNotEmpty())
                 info("${followed.size} rule${if (followed.size == 1) "" else "s"} already applied.")
@@ -624,34 +810,42 @@ object HostNetworkManager {
 
     private suspend fun ensureChains() {
         iptables("-t nat -N $CHAIN_NAT")
+        iptables("-t nat -N $CHAIN_LOCAL")
         iptables("-N $CHAIN_FWD")
         if (!iptables("-t nat -C PREROUTING -j $CHAIN_NAT"))
             iptables("-t nat -I PREROUTING 1 -j $CHAIN_NAT")
+        if (!iptables("-t nat -C OUTPUT -j $CHAIN_LOCAL"))
+            iptables("-t nat -I OUTPUT 1 -j $CHAIN_LOCAL")
         if (!iptables("-C FORWARD -j $CHAIN_FWD"))
             iptables("-I FORWARD 1 -j $CHAIN_FWD")
     }
 
     private suspend fun flushChains() {
         iptables("-t nat -F $CHAIN_NAT")
+        iptables("-t nat -F $CHAIN_LOCAL")
         iptables("-F $CHAIN_FWD")
     }
 
     private suspend fun install(rule: HostForward, subnet: String?): Boolean {
         ensureChains()
 
-        for (offset in 0 until rule.count) {
-            val host = rule.hostPort + offset
-            val inside = rule.containerPort + offset
+        /* One iptables rule covers the whole span, so adding a range costs
+         * the same as adding a single port. */
+        val dnat = "$CHAIN_NAT -p ${rule.proto} --dport ${rule.hostLabel} " +
+            "-m comment --comment $TAG -j DNAT " +
+            "--to-destination ${rule.containerIp}:${rule.containerDest}"
+        if (!iptables("-t nat -C $dnat") && !iptables("-t nat -A $dnat"))
+            return false
 
-            val dnat = "$CHAIN_NAT -p ${rule.proto} --dport $host " +
-                "-m comment --comment $TAG -j DNAT --to-destination ${rule.containerIp}:$inside"
-            if (!iptables("-t nat -C $dnat") && !iptables("-t nat -A $dnat"))
-                return false
+        val accept = "$CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} " +
+            "--dport ${rule.containerLabel} -m comment --comment $TAG -j ACCEPT"
+        if (!iptables("-C $accept")) iptables("-A $accept")
 
-            val accept = "$CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} " +
-                "--dport $inside -m comment --comment $TAG -j ACCEPT"
-            if (!iptables("-C $accept")) iptables("-A $accept")
-        }
+        val local = "$CHAIN_LOCAL -m addrtype --dst-type LOCAL ! -d 127.0.0.0/8 " +
+            "-p ${rule.proto} --dport ${rule.hostLabel} " +
+            "-m comment --comment $TAG -j DNAT " +
+            "--to-destination ${rule.containerIp}:${rule.containerDest}"
+        if (!iptables("-t nat -C $local")) iptables("-t nat -A $local")
 
         // A container's reply has to come back out the same way; the gateway
         // container's own NAT only covers traffic it routes itself.
@@ -671,17 +865,20 @@ object HostNetworkManager {
     }
 
     private suspend fun uninstall(rule: HostForward) {
-        for (offset in 0 until rule.count) {
-            val host = rule.hostPort + offset
-            val inside = rule.containerPort + offset
-            iptables(
-                "-t nat -D $CHAIN_NAT -p ${rule.proto} --dport $host " +
-                    "-m comment --comment $TAG -j DNAT --to-destination ${rule.containerIp}:$inside"
-            )
-            iptables(
-                "-D $CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} --dport $inside " +
-                    "-m comment --comment $TAG -j ACCEPT"
-            )
-        }
+        iptables(
+            "-t nat -D $CHAIN_NAT -p ${rule.proto} --dport ${rule.hostLabel} " +
+                "-m comment --comment $TAG -j DNAT " +
+                "--to-destination ${rule.containerIp}:${rule.containerDest}"
+        )
+        iptables(
+            "-D $CHAIN_FWD -p ${rule.proto} -d ${rule.containerIp} " +
+                "--dport ${rule.containerLabel} -m comment --comment $TAG -j ACCEPT"
+        )
+        iptables(
+            "-t nat -D $CHAIN_LOCAL -m addrtype --dst-type LOCAL ! -d 127.0.0.0/8 " +
+                "-p ${rule.proto} --dport ${rule.hostLabel} " +
+                "-m comment --comment $TAG -j DNAT " +
+                "--to-destination ${rule.containerIp}:${rule.containerDest}"
+        )
     }
 }

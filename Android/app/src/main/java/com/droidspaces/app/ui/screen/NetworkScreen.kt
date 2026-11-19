@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lan
+import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -49,6 +50,8 @@ import com.droidspaces.app.ui.component.DsDialog
 import com.droidspaces.app.ui.component.DsDropdown
 import com.droidspaces.app.ui.component.DsTextFieldDefaults
 import com.droidspaces.app.util.ForwardState
+import com.droidspaces.app.util.AutoBootNetwork
+import com.droidspaces.app.util.HostNetworkManager.ReturnRouteState
 import com.droidspaces.app.util.ForwardStatus
 import com.droidspaces.app.util.HostForward
 import com.droidspaces.app.util.HostLanStatus
@@ -80,6 +83,11 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
     var forwards by remember { mutableStateOf<List<ForwardStatus>>(emptyList()) }
     var running by remember { mutableStateOf<List<RunningContainer>>(emptyList()) }
     var forwardingOn by remember { mutableStateOf(true) }
+    var routeWarning by remember { mutableStateOf<Int?>(null) }
+    var autoBootSettings by remember { mutableStateOf(AutoBootNetwork()) }
+    var busyAutoBoot by remember { mutableStateOf(false) }
+    var busyStatic by remember { mutableStateOf(false) }
+    var showStaticDialog by remember { mutableStateOf(false) }
     var busyLan by remember { mutableStateOf(false) }
     var busyForwarding by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
@@ -95,8 +103,15 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         val lanPrefix = st?.ip?.takeIf { it.isNotBlank() }?.substringBeforeLast('.')?.plus(".")
         running = HostNetworkManager.runningContainers(lanPrefix)
         forwardingOn = HostNetworkManager.forwardingEnabled()
+        autoBootSettings = HostNetworkManager.autoBootConfig()
         forwards = HostNetworkManager.forwardStates(
             HostNetworkManager.listForwards(), running, forwardingOn)
+        routeWarning = when (HostNetworkManager.returnRouteState(st, running)) {
+            ReturnRouteState.READY, ReturnRouteState.NOT_NEEDED -> null
+            ReturnRouteState.NO_LAN -> R.string.forward_route_no_lan
+            ReturnRouteState.NO_GATEWAY -> R.string.forward_route_no_gateway
+            ReturnRouteState.MISSING -> R.string.forward_route_missing
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -110,6 +125,7 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         // A container that came back after a reboot also came back without the
         // route that makes forwarded connections answerable.
         HostNetworkManager.syncGatewayRoute(status, running)
+        refresh()
     }
 
     Column(
@@ -119,11 +135,29 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
             .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 12.dp + bottomBarInset),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        AutoBootNetworkCard(
+            enabled = autoBootSettings.enabled,
+            busy = busyAutoBoot,
+            onToggle = { want ->
+                scope.launch {
+                    busyAutoBoot = true
+                    notice = null
+                    if (!HostNetworkManager.setAutoBootEnabled(want))
+                        notice = context.getString(R.string.autoboot_failed)
+                    refresh()
+                    busyAutoBoot = false
+                }
+            }
+        )
+
         HostLanCard(
             status = status,
             busy = busyLan,
+            busyStatic = busyStatic,
             chosen = chosenBridge,
+            static = autoBootSettings,
             onChoose = { chosenBridge = it },
+            onEditStatic = { showStaticDialog = true },
             onToggle = { want ->
                 scope.launch {
                     busyLan = true
@@ -157,6 +191,25 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         ForwardingCard(
             enabled = forwardingOn,
             busy = busyForwarding,
+            routeWarning = routeWarning,
+            onFixRoute = {
+                scope.launch {
+                    notice = null
+                    val st = status
+                    val ok = if (st?.hasAddress != true) {
+                        HostNetworkManager.join(chosenBridge) &&
+                            HostNetworkManager.syncGatewayRoute(
+                                HostNetworkManager.status(),
+                                HostNetworkManager.runningContainers(null)
+                            )
+                    } else {
+                        HostNetworkManager.syncGatewayRoute(st, running)
+                    }
+                    if (!ok)
+                        notice = context.getString(R.string.forward_route_fix_failed)
+                    refresh()
+                }
+            },
             entries = sortedForwards(forwards, forwardSort),
             sort = forwardSort,
             onSort = { forwardSort = it },
@@ -186,6 +239,25 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
         }
 
         Spacer(Modifier.height(12.dp))
+    }
+
+    if (showStaticDialog) {
+        StaticNetworkDialog(
+            initialIp = autoBootSettings.ip,
+            initialHostname = autoBootSettings.hostname,
+            onDismiss = { showStaticDialog = false },
+            onConfirm = { ip, hostname ->
+                showStaticDialog = false
+                scope.launch {
+                    busyStatic = true
+                    notice = null
+                    if (!HostNetworkManager.setStaticNetwork(ip, hostname))
+                        notice = context.getString(R.string.autoboot_failed)
+                    refresh()
+                    busyStatic = false
+                }
+            }
+        )
     }
 
     editing?.let { rule ->
@@ -233,7 +305,10 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
 private fun HostLanCard(
     status: HostLanStatus?,
     busy: Boolean,
+    busyStatic: Boolean,
     chosen: String?,
+    static: AutoBootNetwork,
+    onEditStatic: () -> Unit,
     onChoose: (String) -> Unit,
     onToggle: (Boolean) -> Unit,
 ) {
@@ -315,6 +390,44 @@ private fun HostLanCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+
+            val quiet = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+            if (static.staticConfigured) {
+                Text(
+                    context.getString(
+                        R.string.host_lan_static_lease, static.ip,
+                        static.hostname.ifBlank {
+                            context.getString(R.string.host_lan_static_noname)
+                        }
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = quiet
+                )
+                Text(
+                    context.getString(R.string.host_lan_static_route, static.subnet, static.ip),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = quiet
+                )
+            } else {
+                Text(
+                    context.getString(R.string.host_lan_static_off),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = quiet
+                )
+            }
+            Surface(
+                onClick = onEditStatic,
+                enabled = !busy && !busyStatic,
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+            ) {
+                Text(
+                    context.getString(R.string.host_lan_static_set),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                )
+            }
         }
     }
 }
@@ -324,9 +437,126 @@ private fun HostLanCard(
  * belongs to the port section the way the LAN switch belongs to its own.
  */
 @Composable
+private fun AutoBootNetworkCard(
+    enabled: Boolean,
+    busy: Boolean,
+    onToggle: (Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 0.dp
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.PowerSettingsNew,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    context.getString(R.string.autoboot_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f)
+                )
+                Switch(checked = enabled, onCheckedChange = onToggle, enabled = !busy)
+            }
+            Text(
+                context.getString(R.string.autoboot_intro),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun StaticNetworkDialog(
+    initialIp: String,
+    initialHostname: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String, String) -> Unit,
+) {
+    val context = LocalContext.current
+    var ip by remember { mutableStateOf(initialIp) }
+    var hostname by remember { mutableStateOf(initialHostname) }
+
+    fun validIp(text: String): Boolean {
+        if (text.isBlank()) return true
+        val octets = text.split('.')
+        return octets.size == 4 && octets.all {
+            it.isNotEmpty() && it.all { ch -> ch.isDigit() } && it.toIntOrNull() in 0..255
+        }
+    }
+
+    val ipOk = validIp(ip)
+    val hostnameOk = hostname.isBlank() ||
+        hostname.matches(Regex("[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"))
+
+    DsDialog(
+        onDismiss = onDismiss,
+        footer = {
+            DialogFooterRow(
+                dismissLabel = context.getString(R.string.cancel),
+                confirmLabel = context.getString(R.string.add),
+                onDismiss = onDismiss,
+                onConfirm = { onConfirm(ip, hostname) },
+                confirmEnabled = ipOk && hostnameOk
+            )
+        }
+    ) {
+        Text(
+            context.getString(R.string.host_lan_static_title),
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.titleLarge
+        )
+        Text(
+            context.getString(R.string.host_lan_static_clear_hint),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        OutlinedTextField(
+            value = ip,
+            onValueChange = { ip = it },
+            label = { Text(context.getString(R.string.autoboot_ip)) },
+            placeholder = { Text(context.getString(R.string.autoboot_ip_hint)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            colors = DsTextFieldDefaults.colors()
+        )
+        OutlinedTextField(
+            value = hostname,
+            onValueChange = { hostname = it },
+            label = { Text(context.getString(R.string.autoboot_hostname)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            colors = DsTextFieldDefaults.colors()
+        )
+        if (!ipOk || !hostnameOk) {
+            Text(
+                context.getString(
+                    if (!ipOk) R.string.autoboot_bad_ip else R.string.autoboot_bad_hostname
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+    }
+}
+
+@Composable
 private fun ForwardingCard(
     enabled: Boolean,
     busy: Boolean,
+    routeWarning: Int?,
+    onFixRoute: () -> Unit,
     entries: List<ForwardStatus>,
     sort: ForwardSort,
     onSort: (ForwardSort) -> Unit,
@@ -380,6 +610,31 @@ private fun ForwardingCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error
                 )
+            }
+            if (enabled && entries.isNotEmpty() && routeWarning != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        context.getString(routeWarning),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Surface(
+                        onClick = onFixRoute,
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.error.copy(alpha = 0.12f)
+                    ) {
+                        Text(
+                            context.getString(R.string.forward_route_fix),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                }
             }
 
             when {
@@ -580,14 +835,13 @@ private fun ForwardDialog(
     var proto by remember { mutableStateOf(initial?.proto ?: "tcp") }
     var note by remember { mutableStateOf(initial?.note.orEmpty()) }
 
-    /* "8080" or "2000-2010" → (first port, how many), null when it is neither.
-     * A span is capped where the field stops being readable; one rule per port
-     * means a span of a thousand would file a thousand iptables calls. */
+    /* "8080" or "2000:2010" → (first port, how many). Accept the old hyphen
+     * spelling too, so a rule saved before the change can still be edited. */
     fun parseSpan(v: String): Pair<Int, Int>? {
-        val parts = v.split('-', limit = 2)
+        val parts = v.split(':', '-', limit = 2)
         val first = parts[0].toIntOrNull() ?: return null
         val last = parts.getOrNull(1)?.toIntOrNull() ?: first
-        if (first !in 1..65535 || last !in 1..65535 || last < first || last - first > 127)
+        if (first !in 1..65535 || last !in 1..65535 || last < first)
             return null
         return first to (last - first + 1)
     }
@@ -677,11 +931,12 @@ private fun ForwardDialog(
         OutlinedTextField(
             value = hostPort,
             onValueChange = { text ->
-                if (text.length <= 11 && text.count { it == '-' } <= 1 &&
-                    text.all { it.isDigit() || it == '-' })
+                if (text.length <= 11 && text.count { it == ':' || it == '-' } <= 1 &&
+                    text.all { it.isDigit() || it == ':' || it == '-' })
                     hostPort = text
             },
             label = { Text(context.getString(R.string.port_forward_host_port)) },
+            placeholder = { Text("2000:2010") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.medium,
@@ -691,8 +946,8 @@ private fun ForwardDialog(
         OutlinedTextField(
             value = containerPort,
             onValueChange = { text ->
-                if (text.length <= 11 && text.count { it == '-' } <= 1 &&
-                    text.all { it.isDigit() || it == '-' })
+                if (text.length <= 11 && text.count { it == ':' || it == '-' } <= 1 &&
+                    text.all { it.isDigit() || it == ':' || it == '-' })
                     containerPort = text
             },
             label = { Text(context.getString(R.string.port_forward_container_port)) },
