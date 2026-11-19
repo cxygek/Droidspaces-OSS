@@ -43,6 +43,10 @@ int ds_hostlan_leave(void);
 /* Print the current state as JSON (json != 0) or as a short human report. */
 int ds_hostlan_status(int json);
 
+/* Put the saved port forwards back in the kernel. Idempotent, reads the same
+ * file the app writes. Returns the number of rules found. */
+int ds_hostnet_forwards_apply(void);
+
 /* 1 when a join intent exists: the host is supposed to be on a LAN. Lets the
  * monitors skip the work entirely when nobody ever joined. */
 int ds_hostlan_configured(void);

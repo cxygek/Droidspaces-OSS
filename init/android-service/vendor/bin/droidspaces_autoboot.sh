@@ -108,6 +108,25 @@ done < "${SORTED_FILE}"
 $BB rm -f "${BOOT_TABLE}" "${SORTED_FILE}" 2>/dev/null
 
 log "Autoboot complete: ${success} started | ${failed} failed"
+
+# The app is not open at boot. Restore the host side now that every container
+# is up, but only while the Network tab's switch says so. No file means on:
+# that keeps the behaviour for anyone who never touches the switch.
+NET_AUTOBOOT_CONF="${DROIDSPACE_DIR}/Net/autoboot.conf"
+if [ "$(get_cfg_val enabled "${NET_AUTOBOOT_CONF}" 2>/dev/null)" = "0" ]; then
+    log "Boot network restore is off"
+else
+    if "${DROIDSPACE_BINARY}" net join; then
+        log "Host LAN joined at boot"
+    else
+        log "WARNING: could not join the host LAN at boot"
+    fi
+    if "${DROIDSPACE_BINARY}" net forwards; then
+        log "Port forwards restored at boot"
+    else
+        log "WARNING: could not restore port forwards at boot"
+    fi
+fi
 }
 
 autoboot

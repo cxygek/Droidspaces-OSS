@@ -18,6 +18,7 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <net/if.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <poll.h>
 #include <spawn.h>
@@ -40,6 +41,13 @@
 extern char **environ;
 
 #define HOSTLAN_CONF "hostlan.conf"
+#define HOSTLAN_FORWARDS "forwards.conf"
+#define HOSTLAN_FORWARD_SWITCH "forwarding.conf"
+
+#define PF_CHAIN_NAT "DSPF_NAT"
+#define PF_CHAIN_FWD "DSPF_FWD"
+#define PF_CHAIN_LOCAL "DSPF_LOCAL"
+#define PF_TAG "dspaces:net"
 #define HOSTLAN_LEASE "hostlan.lease"
 #define HOSTLAN_PID "hostlan.pid"
 #define HOSTLAN_LOCK "hostlan.lock"
@@ -746,6 +754,211 @@ int ds_hostlan_dhcp_run(void) {
 
   close(sock);
   return 0;
+}
+
+/* The app owns the saved list, the kernel only gets rules derived from it.
+ * Boot restores them before the app is open, so this reads the same file and
+ * writes the same chains as HostNetworkManager. */
+static int pf_sh(const char *fmt, ...) {
+  char cmd[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(cmd, sizeof(cmd), fmt, ap);
+  va_end(ap);
+  char *const argv[] = {"sh", "-c", cmd, NULL};
+  return run_command_quiet(argv);
+}
+
+static int pf_enabled(void) {
+  char path[PATH_MAX], buf[128] = {0};
+  net_file(HOSTLAN_FORWARD_SWITCH, path, sizeof(path));
+  if (read_file(path, buf, sizeof(buf)) <= 0)
+    return 1;
+  const char *value = strchr(buf, '=');
+  if (!value)
+    return 1;
+  value++;
+  while (*value == ' ')
+    value++;
+  if (*value == '0' || strncmp(value, "off", 3) == 0 ||
+      strncmp(value, "false", 5) == 0 || strncmp(value, "no", 2) == 0)
+    return 0;
+  return 1;
+}
+
+static int all_digits(const char *text) {
+  if (!*text)
+    return 0;
+  for (; *text; text++)
+    if (*text < '0' || *text > '9')
+      return 0;
+  return 1;
+}
+
+/* "8080" or "2000:2010" to (first, count). A legacy hyphen span still loads. */
+static int parse_span(const char *text, int *first, int *count) {
+  char copy[32];
+  if (!text || strlen(text) >= sizeof(copy))
+    return -1;
+  snprintf(copy, sizeof(copy), "%s", text);
+
+  char *end = strpbrk(copy, ":-");
+  if (end)
+    *end++ = '\0';
+  if (!all_digits(copy))
+    return -1;
+  long from = strtol(copy, NULL, 10);
+  long to = from;
+  if (end) {
+    if (!all_digits(end))
+      return -1;
+    to = strtol(end, NULL, 10);
+  }
+  if (from < 1 || to < from || to > 65535)
+    return -1;
+  *first = (int)from;
+  *count = (int)(to - from + 1);
+  return 0;
+}
+
+static void pf_ensure_chains(void) {
+  pf_sh("iptables -w -t nat -N " PF_CHAIN_NAT " 2>/dev/null");
+  pf_sh("iptables -w -t nat -N " PF_CHAIN_LOCAL " 2>/dev/null");
+  pf_sh("iptables -w -N " PF_CHAIN_FWD " 2>/dev/null");
+  pf_sh("iptables -w -t nat -C PREROUTING -j " PF_CHAIN_NAT " >/dev/null 2>&1 || "
+        "iptables -w -t nat -I PREROUTING 1 -j " PF_CHAIN_NAT);
+  pf_sh("iptables -w -t nat -C OUTPUT -j " PF_CHAIN_LOCAL " >/dev/null 2>&1 || "
+        "iptables -w -t nat -I OUTPUT 1 -j " PF_CHAIN_LOCAL);
+  pf_sh("iptables -w -C FORWARD -j " PF_CHAIN_FWD " >/dev/null 2>&1 || "
+        "iptables -w -I FORWARD 1 -j " PF_CHAIN_FWD);
+}
+
+static void pf_flush_chains(void) {
+  pf_sh("iptables -w -t nat -F " PF_CHAIN_NAT " 2>/dev/null");
+  pf_sh("iptables -w -t nat -F " PF_CHAIN_LOCAL " 2>/dev/null");
+  pf_sh("iptables -w -F " PF_CHAIN_FWD " 2>/dev/null");
+}
+
+static void pf_subnet(char *out, size_t size) {
+  out[0] = '\0';
+  struct hostlan_lease lease;
+  if (!lease_read(&lease) || !lease.ip_be || !lease.mask_be)
+    return;
+  uint32_t net_be = lease.ip_be & lease.mask_be;
+  uint8_t prefix = mask_to_prefix(lease.mask_be);
+  snprintf(out, size, "%u.%u.%u.%u/%u", (net_be >> 24) & 0xFF,
+           (net_be >> 16) & 0xFF, (net_be >> 8) & 0xFF, net_be & 0xFF,
+           (unsigned)prefix);
+}
+
+/* All values reaching these commands were parsed as a protocol, port or IPv4
+ * address. Nothing from the note column is ever used here. */
+static void pf_install(const char *proto, int host_port, int host_count,
+                       const char *ip, int container_port) {
+  char dport[32], dest[32], inside[32];
+  if (host_count > 1) {
+    snprintf(dport, sizeof(dport), "%d:%d", host_port, host_port + host_count - 1);
+    snprintf(dest, sizeof(dest), "%d-%d", container_port,
+             container_port + host_count - 1);
+    snprintf(inside, sizeof(inside), "%d:%d", container_port,
+             container_port + host_count - 1);
+  } else {
+    snprintf(dport, sizeof(dport), "%d", host_port);
+    snprintf(dest, sizeof(dest), "%d", container_port);
+    snprintf(inside, sizeof(inside), "%d", container_port);
+  }
+
+  pf_sh("iptables -w -t nat -A " PF_CHAIN_NAT " -p %s --dport %s "
+        "-m comment --comment " PF_TAG " -j DNAT --to-destination %s:%s",
+        proto, dport, ip, dest);
+  pf_sh("iptables -w -A " PF_CHAIN_FWD " -p %s -d %s --dport %s "
+        "-m comment --comment " PF_TAG " -j ACCEPT", proto, ip, inside);
+  /* A browser on the phone sends to its own LAN address, which never passes
+   * PREROUTING. Loopback is excluded: its reply would come back to 127.0.0.1. */
+  pf_sh("iptables -w -t nat -A " PF_CHAIN_LOCAL
+        " -m addrtype --dst-type LOCAL ! -d 127.0.0.0/8 -p %s --dport %s "
+        "-m comment --comment " PF_TAG " -j DNAT --to-destination %s:%s",
+        proto, dport, ip, dest);
+}
+
+int ds_hostnet_forwards_apply(void) {
+  pf_ensure_chains();
+
+  if (!pf_enabled()) {
+    pf_flush_chains();
+    ds_log("[NET] Port forwarding is off; rules cleared.");
+    return 0;
+  }
+
+  char path[PATH_MAX], buf[16384];
+  net_file(HOSTLAN_FORWARDS, path, sizeof(path));
+  if (read_file(path, buf, sizeof(buf)) <= 0) {
+    pf_flush_chains();
+    return 0;
+  }
+
+  pf_flush_chains();
+  char subnet[32];
+  pf_subnet(subnet, sizeof(subnet));
+
+  int applied = 0;
+  char *save_line = NULL;
+  for (char *line = strtok_r(buf, "\n", &save_line); line;
+       line = strtok_r(NULL, "\n", &save_line)) {
+    while (*line == ' ' || *line == '\r')
+      line++;
+    if (!*line || *line == '#')
+      continue;
+
+    /* The note column is deliberately not read. Splitting a copy keeps the
+     * outer line iterator intact. */
+    char copy[1024];
+    snprintf(copy, sizeof(copy), "%s", line);
+    char *fields[6] = {0};
+    int n = 0;
+    char *save_field = NULL;
+    for (char *f = strtok_r(copy, "|", &save_field); f && n < 6;
+         f = strtok_r(NULL, "|", &save_field))
+      fields[n++] = f;
+    if (n != 5 && n != 6)
+      continue;
+
+    if (strcmp(fields[0], "tcp") != 0 && strcmp(fields[0], "udp") != 0)
+      continue;
+    int host_port = 0, host_count = 0, container_port = 0, container_count = 0;
+    if (parse_span(fields[1], &host_port, &host_count) != 0 ||
+        parse_span(fields[4], &container_port, &container_count) != 0)
+      continue;
+    if (container_count > 1 && container_count != host_count)
+      continue;
+
+    struct in_addr addr;
+    char ip[INET_ADDRSTRLEN];
+    if (inet_pton(AF_INET, fields[3], &addr) != 1)
+      continue;
+    if (!inet_ntop(AF_INET, &addr, ip, sizeof(ip)))
+      continue;
+
+    pf_install(fields[0], host_port, host_count, ip, container_port);
+    applied++;
+  }
+
+  if (subnet[0]) {
+    pf_sh("iptables -w -t nat -C POSTROUTING -s %s ! -d %s "
+          "-m comment --comment " PF_TAG ":masq -j MASQUERADE >/dev/null 2>&1 || "
+          "iptables -w -t nat -A POSTROUTING -s %s ! -d %s "
+          "-m comment --comment " PF_TAG ":masq -j MASQUERADE",
+          subnet, subnet, subnet, subnet);
+  }
+
+  /* Android's tethering rules drop forwarded packets even after DNAT. */
+  for (int i = 0; i < 8; i++)
+    if (pf_sh("iptables -w -D tetherctrl_FORWARD -j DROP 2>/dev/null") != 0)
+      break;
+
+  ds_log("[NET] Port forwards: %d rule%s from disk", applied,
+         applied == 1 ? "" : "s");
+  return applied;
 }
 
 /* Join / leave ------------------------------------------------------------ */
