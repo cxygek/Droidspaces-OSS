@@ -22,13 +22,24 @@ import com.termux.terminal.TerminalSessionClient
  *   args = ["/system/bin/sh", "-c", "cmd"]  →  execvp(sh, ["sh", "-c", "cmd"])
  *   shell sees argv[0]="sh", argv[1]="-c", argv[2]="cmd"  ← works correctly
  *
- * ── Working command (confirmed on device) ───────────────────────────────────
+ * ── Command shape (confirmed on device) ─────────────────────────────────────
  *
- *   sh -c "su -c 'droidspaces -n "Name" enter user'"
+ *   sh -c "exec su -c 'droidspaces -n \"Name\" enter user'"
+ *
+ * The shell termux starts exec's su, and su exec's the final command, so one
+ * process replaces the next instead of stacking. This drops one process per
+ * terminal from the old
+ *   sh -c "su -c '...'"  →  sh + su + droidspaces
+ * to
+ *   sh -c "exec su -c '...'"  →  sh(→su→droidspaces)  [one process]
+ *
+ * execvp's first arg stays /system/bin/sh: termux only accepts a real shell
+ * as its shellPath (using su directly failed with ENOENT), so sh is retained
+ * and `exec` is what removes the layer.
  *
  * Mapped to TerminalSession:
  *   shell = "/system/bin/sh"
- *   args  = ["/system/bin/sh", "-c", "su -c 'droidspaces -n \"Name\" enter user'"]
+ *   args  = ["/system/bin/sh", "-c", "exec su -c '...'"]
  */
 object DroidspacesTerminalSession {
 
@@ -53,14 +64,17 @@ object DroidspacesTerminalSession {
         // rather than an injectable payload. A username with metacharacters falls
         // back to root the same way. safeName cannot hold " ' $ or `, the escape is
         // belt-and-suspenders.
-        val shArg = if (safeName == null) "su" else {
-            val user = containerUser?.takeIf { SAFE_USER.matches(it) } ?: "root"
-            // Name the keeper session after the tab the app already created, so
-            // closing that tab can end exactly this shell.
-            val sessionOpt = safeSessionId?.let { "--session-id $it " } ?: ""
-            "su -c 'droidspaces ${sessionOpt}-n \"${safeName.replace("\"", "\\\"")}\" enter $user'"
-        }
-        return newSession(sessionClient, shArg)
+        if (safeName == null) return newRootShell(sessionClient)
+
+        val user = containerUser?.takeIf { SAFE_USER.matches(it) } ?: "root"
+        // Name the keeper session after the tab the app already created, so
+        // closing that tab can end exactly this shell. Use the absolute binary
+        // path: the command runs through su -c, which may not inherit our
+        // PATH, so do not rely on `droidspaces` being found by name.
+        val sessionOpt = safeSessionId?.let { "--session-id $it " } ?: ""
+        val command = "${Constants.DROIDSPACES_BINARY_PATH} ${sessionOpt}-n " +
+            "\"${safeName.replace("\"", "\\\"")}\" enter $user"
+        return newSession(sessionClient, command)
     }
 
     /**
@@ -76,23 +90,37 @@ object DroidspacesTerminalSession {
         // Ids come from the backend's JSON, so this is only a guard against a
         // malformed record. Say why the tab is empty instead of opening a root
         // shell the user did not ask for.
-        val shArg = if (safeId == null) {
-            "echo 'Invalid terminal session id.'"
-        } else {
-            "su -c 'droidspaces session attach $safeId'"
-        }
-        return newSession(sessionClient, shArg)
+        if (safeId == null)
+            return newSession(sessionClient, "echo 'Invalid terminal session id.'")
+        return newSession(sessionClient,
+            "${Constants.DROIDSPACES_BINARY_PATH} session attach $safeId")
     }
 
+    /** A bare root shell (no container): sh exec's su, so no shell is left behind. */
+    private fun newRootShell(sessionClient: TerminalSessionClient): TerminalSession =
+        newSession(sessionClient, "exec su", quote = false)
+
+    /**
+     * Build a session that exec's su, which exec's `command`.
+     *
+     * Both execs replace their process instead of stacking a new one: the shell
+     * termux starts becomes su, and su becomes the final command. Verified at
+     * the command line as both root and the app's untrusted UID - only one
+     * process remains instead of the old `sh -c "su -c '...'"` pair.
+     *
+     * args[0] MUST be the shell path: termux's JNI passes args straight to
+     * execvp and does not prepend shellPath as argv[0]. It must stay sh - su
+     * as argv[0] fails to exec (termux restricts the shell to a real shell).
+     */
     private fun newSession(
         sessionClient: TerminalSessionClient,
-        shArg: String,
+        command: String,
+        quote: Boolean = true,
     ): TerminalSession = TerminalSession(
         /* shell      = */ "/system/bin/sh",
         /* workingDir = */ "/sdcard",
-        // args[0] MUST be the shell path - the JNI uses args directly as argv,
-        // it does NOT prepend shellPath as argv[0].
-        /* args       = */ arrayOf("/system/bin/sh", "-c", shArg),
+        /* args       = */ arrayOf("/system/bin/sh", "-c",
+            if (quote) "exec su -c '${command.replace("'", "'\\''")}'" else command),
         /* env        = */ buildEnv().toTypedArray(),
         /* rows       = */ TerminalEmulator.DEFAULT_TERMINAL_TRANSCRIPT_ROWS,
         /* client     = */ sessionClient,
