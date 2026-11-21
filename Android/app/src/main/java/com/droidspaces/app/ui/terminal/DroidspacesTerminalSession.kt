@@ -72,8 +72,13 @@ object DroidspacesTerminalSession {
         // path: the command runs through su -c, which may not inherit our
         // PATH, so do not rely on `droidspaces` being found by name.
         val sessionOpt = safeSessionId?.let { "--session-id $it " } ?: ""
-        val command = "${Constants.DROIDSPACES_BINARY_PATH} ${sessionOpt}-n " +
-            "\"${safeName.replace("\"", "\\\"")}\" enter $user"
+        // Quote the name only when it actually needs it. Magisk/KernelSU `su -c`
+        // execs a simple command directly, but forks a /system/bin/sh as soon as
+        // the command string contains shell quoting. An unquoted single-token
+        // name therefore avoids one extra shell process per terminal tab.
+        val nameArg = if (safeName.any { it.isWhitespace() })
+            "\"${safeName.replace("\"", "\\\"")}\"" else safeName
+        val command = "${Constants.DROIDSPACES_BINARY_PATH} ${sessionOpt}-n $nameArg enter $user"
         return newSession(sessionClient, command)
     }
 
