@@ -165,6 +165,11 @@ void ds_net_setup_android_routing(ds_nl_ctx_t *ctx) {
 
 /* Re-probe which uplink is active and update the ip rule if needed. */
 void do_uplink_reprobe(void) {
+  /* Pick up an edited upstream_interfaces from the running container's config
+   * before resolving, so a save in the app changes the WAN path on the next
+   * heartbeat instead of requiring a restart. No-op when unchanged. */
+  ds_uplink_reload_config();
+
   ds_nl_ctx_t *ctx = ds_nl_open();
   if (!ctx)
     return;

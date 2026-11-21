@@ -305,6 +305,11 @@ void ds_net_stop_route_monitor(void) {
 void ds_net_mark_local_forward_active(void) { g_local_forward_active = 1; }
 
 void ds_net_start_route_monitor(const char *container_name) {
+  /* Remember which container's config owns the pinned upstream so each
+   * reprobe can re-read it - this is what makes a saved upstream change take
+   * effect without a container restart. */
+  ds_uplink_set_owner(container_name);
+
   pthread_mutex_lock(&g_gw_mutex);
   /* Idempotent: exactly one monitor thread per process.  setup_veth_host_side
    * calls this on every boot cycle (including reboots); the monitor tracks the

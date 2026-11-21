@@ -56,6 +56,9 @@ int setup_nat6_host(ds_nl_ctx_t *ctx, struct ds_config *cfg,
                     struct in6_addr *prefix);
 void ds_net_setup_android_routing(ds_nl_ctx_t *ctx);
 void do_uplink_reprobe(void);
+/* Runtime reload of the pinned upstream from the NAT container config. */
+void ds_uplink_set_owner(const char *name);
+void ds_uplink_reload_config(void);
 int gateway_segment_lock(const char *bridge);
 void gateway_segment_unlock(int fd);
 pid_t gateway_pid_of(const char *name);

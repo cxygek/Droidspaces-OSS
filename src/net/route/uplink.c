@@ -27,6 +27,76 @@
 char g_upstream_ifaces[DS_MAX_UPSTREAM_IFACES][IFNAMSIZ];
 int g_upstream_count = 0;
 
+/* The NAT container whose config owns the pinned upstream. The route monitor
+ * runs only in that container's monitor process; keeping the name lets it
+ * re-read the config at runtime so a saved upstream change takes effect
+ * without a container restart. Set once when the monitor thread starts. */
+static char g_uplink_owner[256];
+
+void ds_uplink_set_owner(const char *name) {
+  if (name)
+    safe_strncpy(g_uplink_owner, name, sizeof(g_uplink_owner));
+}
+
+/* Re-read upstream_interfaces from the owner's container.config into the
+ * globals the uplink probe consults. Called on every route-monitor reprobe,
+ * so saving the config in the app changes the container's WAN path within one
+ * heartbeat (~1.5s) instead of needing stop/start. A missing or unchanged
+ * value is a no-op; clearing the field restores automatic detection. */
+void ds_uplink_reload_config(void) {
+  if (!g_uplink_owner[0])
+    return;
+
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "%s/Containers/%s/container.config",
+           get_workspace_dir(), g_uplink_owner);
+
+  char buf[16384] = {0};
+  if (read_file(path, buf, sizeof(buf)) <= 0)
+    return; /* config gone/unreadable: keep the last known upstream */
+
+  char value[512] = {0};
+  char *save = NULL;
+  for (char *line = strtok_r(buf, "\n", &save); line;
+       line = strtok_r(NULL, "\n", &save)) {
+    while (*line == ' ' || *line == '\r' || *line == '\t')
+      line++;
+    if (strncmp(line, "upstream_interfaces=", 20) == 0) {
+      snprintf(value, sizeof(value), "%s", line + 20);
+      break;
+    }
+  }
+
+  char next[DS_MAX_UPSTREAM_IFACES][IFNAMSIZ];
+  memset(next, 0, sizeof(next));
+  int next_count = 0;
+  if (value[0]) {
+    if (ds_parse_iface_csv(value, next, &next_count, DS_MAX_UPSTREAM_IFACES) != 0)
+      return; /* malformed list: ignore, do not pin to garbage */
+  }
+
+  if (next_count == g_upstream_count &&
+      (next_count == 0 ||
+       memcmp(next, g_upstream_ifaces,
+              (size_t)next_count * IFNAMSIZ) == 0))
+    return; /* unchanged: no churn, no log spam */
+
+  int was_pinned = g_upstream_count > 0;
+  g_upstream_count = next_count;
+  for (int i = 0; i < next_count; i++)
+    safe_strncpy(g_upstream_ifaces[i], next[i], IFNAMSIZ);
+  /* Clear the tail so a later shorter->equal comparison sees no stale names. */
+  for (int i = next_count; i < DS_MAX_UPSTREAM_IFACES; i++)
+    g_upstream_ifaces[i][0] = '\0';
+
+  if (g_upstream_count > 0)
+    ds_log("[NET] Upstream reloaded from config: %d interface%s (%s)",
+           g_upstream_count, g_upstream_count == 1 ? "" : "s",
+           g_upstream_ifaces[0]);
+  else if (was_pinned)
+    ds_log("[NET] Upstream reloaded from config: automatic detection restored");
+}
+
 /* Returns 1 if ifname exists and is both UP and RUNNING.
  * On Android, the active data interface has IFF_RUNNING set; an interface
  * that is physically present but not carrying data loses IFF_RUNNING. */
