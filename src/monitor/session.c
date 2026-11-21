@@ -28,8 +28,24 @@ static int g_ctl = -1;
 static char g_name[256];
 static pid_t g_keepers[DS_SESSION_MAX];
 
+/* Pinned once at monitor startup, before any atomic binary swap can happen.
+ * A live monitor is more useful than a fresh one: on a droidspaces update the
+ * on-disk binary is replaced with mv, which leaves /proc/self/exe reading
+ * "<path> (deleted)". Reading it later, in keeper_spawn_shell, would exec that
+ * dead string and fail with ENOENT. The pinned string keeps resolving to the
+ * new file on disk, exactly like the daemon's g_self_path does. */
+static char g_exe_path[PATH_MAX];
+
 void ds_session_host_start(const char *container_name) {
   safe_strncpy(g_name, container_name, sizeof(g_name));
+
+  /* Pin the binary path while /proc/self/exe is still clean. If it cannot be
+   * read, keepers fall back to a live readlink (best effort). */
+  ssize_t pn = readlink("/proc/self/exe", g_exe_path, sizeof(g_exe_path) - 1);
+  if (pn > 0)
+    g_exe_path[pn] = '\0';
+  else
+    g_exe_path[0] = '\0';
 
   char sock[128];
   ds_monitor_sock_name(g_name, DS_SESSION_CTL_LEAF, sock, sizeof(sock));
@@ -182,13 +198,17 @@ void ds_session_host_accept(void) {
   }
 
   char exe[PATH_MAX];
-  ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-  if (n <= 0) {
-    refuse(c, "cannot find the droidspaces binary");
-    close(c);
-    return;
+  if (g_exe_path[0]) {
+    safe_strncpy(exe, g_exe_path, sizeof(exe));
+  } else {
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) {
+      refuse(c, "cannot find the droidspaces binary");
+      close(c);
+      return;
+    }
+    exe[n] = '\0';
   }
-  exe[n] = '\0';
 
   /* The monitor is multi-threaded, so the keeper is spawned rather than
    * forked: between fork and exec only async-signal-safe calls are allowed,
@@ -498,13 +518,17 @@ static int keeper_spawn_shell(int *master_out, pid_t *child_out,
   (void)fcntl(master, F_SETFD, FD_CLOEXEC);
 
   char exe[PATH_MAX];
-  ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-  if (n <= 0) {
-    close(master);
-    close(slave);
-    return -1;
+  if (g_exe_path[0]) {
+    safe_strncpy(exe, g_exe_path, sizeof(exe));
+  } else {
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) {
+      close(master);
+      close(slave);
+      return -1;
+    }
+    exe[n] = '\0';
   }
-  exe[n] = '\0';
 
   char *av[] = {exe, "-n", container, "enter", user, NULL};
 
