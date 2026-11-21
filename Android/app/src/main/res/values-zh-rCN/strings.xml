@@ -729,6 +729,7 @@
     <string name="forward_route_fix_failed">回程路由恢复失败。</string>
     <string name="port_forward_bad_port">端口需在 1-65535 之间。</string>
     <string name="port_forward_span_mismatch">容器端口段的长度需与手机端口段一致。</string>
+    <string name="port_forward_port_conflict">与已有的 %1$s 规则 %2$s → %3$s 冲突，请换用其他手机端口。</string>
     <string name="forward_sort_port">按端口</string>
     <string name="forward_sort_container">按容器</string>
     <string name="port_forward_failed">规则应用失败。</string>

@@ -268,6 +268,7 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
                       else running + RunningContainer(rule.container, rule.containerIp)
         ForwardDialog(
             containers = targets,
+            existing = forwards.map { it.rule },
             initial = rule,
             onDismiss = { editing = null },
             onConfirm = { updated ->
@@ -286,6 +287,7 @@ fun NetworkScreen(modifier: Modifier = Modifier, bottomBarInset: Dp = 0.dp) {
     if (adding) {
         ForwardDialog(
             containers = running,
+            existing = forwards.map { it.rule },
             onDismiss = { adding = false },
             onConfirm = { rule ->
                 adding = false
@@ -821,6 +823,7 @@ private fun ForwardRow(
 @Composable
 private fun ForwardDialog(
     containers: List<RunningContainer>,
+    existing: List<HostForward>,
     onDismiss: () -> Unit,
     onConfirm: (HostForward) -> Unit,
     initial: HostForward? = null,
@@ -857,7 +860,21 @@ private fun ForwardDialog(
         )
     val spanMismatch = hostSpan != null && targetSpan != null &&
         targetSpan.second > 1 && targetSpan.second != hostSpan.second
-    val canAdd = target != null && target?.ip?.isNotBlank() == true && portsOk
+
+    /* Two rules whose host ports overlap on the same protocol fight over the
+     * same DNAT match: whichever iptables installed first wins, so one silently
+     * shadows the other. Reject any overlap before a rule can be added. When
+     * editing, exclude the rule being replaced (HostForward is a data class,
+     * so == compares its fields even if the list was refreshed meanwhile). */
+    val conflict: HostForward? = hostSpan?.let { (first, count) ->
+        val last = first + count - 1
+        existing.firstOrNull { other ->
+            other != initial && other.proto == proto &&
+                first <= other.hostLast && other.hostPort <= last
+        }
+    }
+    val hasConflict = conflict != null
+    val canAdd = target != null && target?.ip?.isNotBlank() == true && portsOk && !hasConflict
 
     DsDialog(
         onDismiss = onDismiss,
@@ -985,6 +1002,18 @@ private fun ForwardDialog(
                 context.getString(
                     if (spanMismatch) R.string.port_forward_span_mismatch
                     else R.string.port_forward_bad_port
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+        if (conflict != null) {
+            Text(
+                context.getString(
+                    R.string.port_forward_port_conflict,
+                    conflict.proto.uppercase(),
+                    conflict.hostLabel,
+                    conflict.targetLabel
                 ),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error
