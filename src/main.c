@@ -188,6 +188,14 @@ int main(int argc, char **argv) {
   int ret = 0;
   struct ds_config cfg;
   char raw_names[4096] = "";
+
+  /* Probe the local timezone while the host rootfs is still mounted. The
+   * process that becomes container init will later pivot_root into a guest
+   * where /system/bin/date does not exist; probing here means every log line
+   * it writes - including the post-pivot capability/seccomp hardening - gets
+   * the same local timestamp as the rest of the log. */
+  ds_log_local_timezone();
+
   ds_config_init(&cfg);
 
   safe_strncpy(cfg.prog_name, argv[0], sizeof(cfg.prog_name));

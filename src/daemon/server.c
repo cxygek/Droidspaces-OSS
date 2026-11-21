@@ -66,7 +66,7 @@ static void log_stamp(char *buf, size_t size) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   struct tm tm;
-  localtime_r(&ts.tv_sec, &tm);
+  ds_log_localtime(&ts.tv_sec, &tm);
   snprintf(buf, size, "[%04d-%02d-%02d %02d:%02d:%02d.%03ld] ", tm.tm_year + 1900,
            tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
            ts.tv_nsec / 1000000);
@@ -78,15 +78,12 @@ static void log_pipe_write(const char *text) {
   pthread_mutex_lock(&g_pipe_log_lock);
   if (g_pipe_log_fp) {
     fprintf(g_pipe_log_fp, "%s%s\n", stamp, text);
-    /* Rotate here rather than from the accept loop: this thread owns the
-     * handle, and a rename under an open FILE would keep writing to the
-     * renamed one. */
+    /* Safety net for a single very long run. The per-start rotation above
+     * already keeps .old as the previous run; here we only need to bound this
+     * run's size, so truncate in place rather than stacking another file. */
     if (ftell(g_pipe_log_fp) >= DAEMON_LOG_MAX) {
       fclose(g_pipe_log_fp);
-      char old_path[sizeof(g_daemon_log_path) + 32];
-      snprintf(old_path, sizeof(old_path), "%s.old", g_daemon_log_path);
-      rename(g_daemon_log_path, old_path);
-      g_pipe_log_fp = fopen(g_daemon_log_path, "ae");
+      g_pipe_log_fp = fopen(g_daemon_log_path, "we");
     }
     fflush(g_pipe_log_fp);
   }
@@ -231,8 +228,7 @@ static void handle_conn(int conn) {
 
 /* daemonize the process: detach from terminal and protect from OOM killer */
 static void daemonize(int foreground) {
-  /* Every line the reader thread stamps uses localtime_r(); without this the
-   * stamps come out UTC on Android. */
+  /* Cache the local offset before any log line is stamped. */
   ds_log_local_timezone();
 
   if (is_android()) {
@@ -297,7 +293,18 @@ static void daemonize(int foreground) {
     char log_path[PATH_MAX];
     snprintf(log_path, sizeof(log_path), "%s/droidspacesd.log", get_logs_dir());
     safe_strncpy(g_daemon_log_path, log_path, sizeof(g_daemon_log_path));
-    rotate_log(log_path, 2 * 1024 * 1024);
+    /* Rotate on every start, not on size: a daemon that runs for weeks would
+     * otherwise grow one log to hundreds of thousands of lines. Keep the
+     * previous run as .old so a crash just before restart is still readable. */
+    {
+      struct stat st;
+      if (stat(log_path, &st) == 0 && st.st_size > 0) {
+        char old_path[sizeof(g_daemon_log_path) + 8];
+        snprintf(old_path, sizeof(old_path), "%s.old", log_path);
+        unlink(old_path); /* only one generation: last run is enough */
+        rename(log_path, old_path);
+      }
+    }
 
     if (!foreground) {
       /* Background: stdout and stderr go through the reader, which timestamps

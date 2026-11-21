@@ -648,6 +648,20 @@ object ContainerManager {
 
             logger.i("Container directory successfully deleted.")
             logger.i("")
+
+            // Step 4: Delete the container's log directory (Logs/<name>,
+            // alongside Containers/). Its logs are only meaningful while the
+            // container exists and are otherwise orphaned on every uninstall.
+            val logPath = "${Constants.WORKSPACE_PATH}/Logs/${sanitizeContainerName(container.name)}"
+            logger.i("Step 4: Deleting log directory: $logPath")
+            val logDeleteResult = Shell.cmd(
+                "rm -rf ${ContainerCommandBuilder.quote(logPath)} 2>&1").exec()
+            if (!logDeleteResult.isSuccess) {
+                logger.w("Could not delete log directory: ${logDeleteResult.err.joinToString(" ")}")
+            } else {
+                logger.i("Log directory deleted.")
+            }
+            logger.i("")
             logger.i("Uninstallation completed successfully!")
 
             Result.success(Unit)

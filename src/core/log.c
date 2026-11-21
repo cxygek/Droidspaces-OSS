@@ -6,19 +6,93 @@
  */
 
 #include "droidspaces.h"
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-/* Every timestamp in these logs is localtime_r(), and localtime_r() reads TZ
- * only when tzset() has run first (bionic never runs it for the _r form).
- * The daemon is a static musl binary and cannot read Android properties, so
- * the launcher exports TZ; this makes sure it is actually picked up. */
-void ds_log_local_timezone(void) {
-  static int done = 0;
-  if (done)
+/* Timestamp timezone: a cached UTC offset, not TZ. Container init clearenv()s
+ * before its post-pivot log lines, wiping any inherited TZ, so the offset is
+ * probed once in main() while the host rootfs is still mounted (via Android's
+ * `date +%:z` - no zoneinfo needed in this static musl binary). Every stamp
+ * then comes from gmtime_r(time + offset), independent of the environment. */
+static long g_tz_offset_sec = 0;
+static int g_tz_probed = 0;
+
+void ds_log_localtime(const time_t *when, struct tm *out) {
+  time_t shifted = *when + g_tz_offset_sec;
+  gmtime_r(&shifted, out);
+}
+
+static void probe_timezone(void) {
+  g_tz_probed = 1;
+
+  /* An inherited POSIX TZ (the launch script sets LMT+HH:MM for the daemon)
+   * gives the offset without spawning anything. */
+  const char *tz = getenv("TZ");
+  if (tz && tz[0]) {
+    const char *sign = strchr(tz, '-');
+    if (!sign)
+      sign = strchr(tz, '+');
+    if (sign) {
+      long hh = 0, mm = 0;
+      if (sscanf(sign + 1, "%ld:%ld", &hh, &mm) >= 1) {
+        /* POSIX TZ sign is inverted: LMT-08:00 means UTC+08:00. */
+        g_tz_offset_sec = (sign[0] == '-' ? 1 : -1) * (hh * 3600 + mm * 60);
+        return;
+      }
+    }
+  }
+
+  int fds[2];
+  if (pipe(fds) < 0)
     return;
-  done = 1;
-  tzset();
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return;
+  }
+  if (pid == 0) {
+    dup2(fds[1], STDOUT_FILENO);
+    int dn = open("/dev/null", O_WRONLY);
+    if (dn >= 0) {
+      dup2(dn, STDERR_FILENO);
+      close(dn);
+    }
+    close(fds[0]);
+    close(fds[1]);
+    execl("/system/bin/date", "date", "+%:z", (char *)NULL);
+    _exit(127);
+  }
+
+  close(fds[1]);
+  char out[32] = {0};
+  size_t used = 0;
+  while (used + 1 < sizeof(out)) {
+    ssize_t n = read(fds[0], out + used, sizeof(out) - 1 - used);
+    if (n <= 0)
+      break;
+    used += (size_t)n;
+  }
+  out[used] = '\0';
+  close(fds[0]);
+  int status = 0;
+  waitpid(pid, &status, 0);
+
+  /* "+08:00" → 8h; no TZ env needed, so clearenv() cannot undo it. */
+  if (used >= 6 && (out[0] == '+' || out[0] == '-')) {
+    long hh = 0, mm = 0;
+    if (sscanf(out + 1, "%ld:%ld", &hh, &mm) >= 1)
+      g_tz_offset_sec = (out[0] == '+' ? 1 : -1) * (hh * 3600 + mm * 60);
+  }
+}
+
+void ds_log_local_timezone(void) {
+  if (g_tz_probed)
+    return;
+  probe_timezone();
 }
 
 int ds_log_silent = 0;
@@ -55,7 +129,7 @@ static void write_to_log_file(const char *name, const char *component,
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   struct tm tm;
-  localtime_r(&ts.tv_sec, &tm);
+  ds_log_localtime(&ts.tv_sec, &tm);
 
   /* Pre-opened FD path: survives pivot_root / mount namespace changes.
    * dprintf() writes directly to the fd - no dup/fdopen/fclose overhead.
@@ -176,6 +250,19 @@ void ds_open_container_log(struct ds_config *cfg) {
 
   char log_path[PATH_MAX];
   container_log_path(cfg->container_name, "log", log_path, sizeof(log_path));
+
+  /* Rotate on every boot, like the daemon log: a long-lived or frequently
+   * restarted container would otherwise stack enormous logs. Keep the
+   * previous boot as log.old so a crash just before restart stays readable. */
+  {
+    struct stat st;
+    if (stat(log_path, &st) == 0 && st.st_size > 0) {
+      char old_path[PATH_MAX + 8];
+      snprintf(old_path, sizeof(old_path), "%s.old", log_path);
+      unlink(old_path); /* one generation: the previous boot is enough */
+      rename(log_path, old_path);
+    }
+  }
 
   int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
   if (fd >= 0)
