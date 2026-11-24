@@ -41,6 +41,32 @@ const char *get_sessions_dir(void) {
   return sessions_path;
 }
 
+/* Self path
+ *
+ * /proc/self/exe is only trustworthy until the file it names is replaced. A
+ * droidspaces update swaps the binary with mv, and from then on the symlink
+ * reads "<path> (deleted)". Anything that exec's that string dies with ENOENT,
+ * which is how a running monitor lost the ability to open terminals or restart
+ * the DHCP keeper. Pinning the string at startup keeps it pointing at whatever
+ * now lives at that path. */
+static char g_self_path[PATH_MAX];
+
+void ds_self_path_pin(void) {
+  ssize_t n = readlink("/proc/self/exe", g_self_path, sizeof(g_self_path) - 1);
+  g_self_path[n > 0 ? n : 0] = '\0';
+}
+
+const char *ds_self_path(void) {
+  if (g_self_path[0])
+    return g_self_path;
+  /* Not pinned: read it now. A short-lived process is still clean, and a
+   * stale answer is no worse than the symlink it replaces. */
+  static char live[PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", live, sizeof(live) - 1);
+  live[n > 0 ? n : 0] = '\0';
+  return live;
+}
+
 int ensure_workspace(void) {
   mkdir_p(get_workspace_dir(), 0755);
   mkdir_p(get_pids_dir(), 0755);

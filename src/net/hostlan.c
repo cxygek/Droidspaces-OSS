@@ -219,13 +219,14 @@ static int keeper_spawn(void) {
   if (keeper_alive())
     return 0;
 
+  /* Spawned from the monitor loop too, so this must not be a live readlink:
+   * after a binary swap it would name a deleted file. */
   char exe[PATH_MAX];
-  ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-  if (n <= 0) {
+  safe_strncpy(exe, ds_self_path(), sizeof(exe));
+  if (!exe[0]) {
     ds_warn("[NET] Host LAN: cannot resolve our own binary");
     return -1;
   }
-  exe[n] = '\0';
 
   posix_spawnattr_t attr;
   posix_spawn_file_actions_t fa;

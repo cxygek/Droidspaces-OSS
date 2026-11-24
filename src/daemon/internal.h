@@ -53,7 +53,6 @@ void daemon_log_tee(const char *prefix, const char *fmt, ...)
     daemon_log_tee("-", fmt, ##__VA_ARGS__);                                   \
   } while (0)
 
-extern char g_self_path[PATH_MAX];
 void send_exit(int fd, int code);
 void free_req(ds_req_t *r);
 int recv_req(int fd, ds_req_t *r);

@@ -115,6 +115,13 @@ const char *get_logs_dir(void);
 const char *get_sessions_dir(void);
 int ensure_workspace(void);
 
+/* The running binary's absolute path. Long-lived processes pin it once at
+ * startup while /proc/self/exe is still clean: an update replaces the binary
+ * with mv, after which the symlink reads "<path> (deleted)" and exec'ing it
+ * fails with ENOENT. */
+void ds_self_path_pin(void);
+const char *ds_self_path(void);
+
 /* platform.c */
 int is_android(void);
 void android_native_personality(void);

@@ -443,21 +443,10 @@ int ds_daemon_run(int foreground, char **argv) {
 
   daemonize(foreground);
 
-  /*
-   * Pin our absolute path NOW, once, in the final daemon process.
-   * /proc/self/exe is still clean here. After any atomic mv swap that
-   * replaces our binary, g_self_path still holds the same string but
-   * it now resolves to the new file on disk. Every fork()+reexec() from
-   * this point on will automatically exec the updated binary.
-   */
-  {
-    ssize_t n =
-        readlink("/proc/self/exe", g_self_path, sizeof(g_self_path) - 1);
-    if (n > 0)
-      g_self_path[n] = '\0';
-    else
-      g_self_path[0] = '\0'; /* reexec() will fall back gracefully */
-  }
+  /* Pin our absolute path now, once, in the final daemon process: every
+   * fork()+reexec() from here on exec's whatever lives at that path, so an mv
+   * swap of the binary is picked up without restarting the daemon. */
+  ds_self_path_pin();
 
   signal(SIGUSR2, sigusr2_handler);
 

@@ -17,15 +17,6 @@
 
 #include "internal.h"
 
-/*
- * g_self_path is populated once during daemon startup (after daemonize()).
- * Subsequent fork()+reexec() children inherit a copy of this path.
- * After an atomic `mv` replaces the binary on disk, this path resolves to
- * the NEW binary - so all future sessions transparently use the updated code
- * without restarting the daemon.
- */
-char g_self_path[PATH_MAX];
-
 void send_exit(int fd, int code) {
   uint32_t nc = htonl((uint32_t)code);
   ds_send_frame(fd, MSG_EXIT, &nc, 4);
@@ -86,14 +77,9 @@ int recv_req(int fd, ds_req_t *r) {
 /* re-execute the droidspaces binary */
 
 void reexec(char **argv) {
-  /*
-   * Use the path pinned at daemon startup. After an atomic mv swap,
-   * g_self_path resolves to the new binary automatically. If for some
-   * reason it was never set, fall back to the symlink (which may have
-   * (deleted) but is better than nothing).
-   */
-  const char *path = (g_self_path[0] != '\0') ? g_self_path : "/proc/self/exe";
-  execv(path, argv);
+  /* The path pinned at daemon startup, so an mv swap of the binary is picked
+   * up by every fork()+reexec() child without restarting the daemon. */
+  execv(ds_self_path(), argv);
   _exit(127);
 }
 

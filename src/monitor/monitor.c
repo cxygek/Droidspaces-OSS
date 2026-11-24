@@ -30,6 +30,11 @@ void ds_monitor_run(struct ds_config *cfg, int sync_pipe_write) {
   sync_pipe[0] = -1;
   sync_pipe[1] = sync_pipe_write;
 
+  /* Before anything else: keepers and the DHCP helper are spawned with this
+   * path for the life of the container, and a binary swap would otherwise
+   * leave them exec'ing a deleted file. */
+  ds_self_path_pin();
+
   if (setsid() < 0 && errno != EPERM) {
     /* Fatal only if it's not EPERM (which means already leader) */
     ds_error("setsid failed: %s", strerror(errno));
