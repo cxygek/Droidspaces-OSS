@@ -47,9 +47,11 @@ void ds_uplink_reload_config(void) {
   if (!g_uplink_owner[0])
     return;
 
+  /* Sanitises the name the way every other reader does: the directory is
+   * "My-Container" even when the display name is "My Container". */
   char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s/Containers/%s/container.config",
-           get_workspace_dir(), g_uplink_owner);
+  if (ds_config_host_path(g_uplink_owner, path, sizeof(path)) < 0)
+    return;
 
   char buf[16384] = {0};
   if (read_file(path, buf, sizeof(buf)) <= 0)
@@ -63,6 +65,10 @@ void ds_uplink_reload_config(void) {
       line++;
     if (strncmp(line, "upstream_interfaces=", 20) == 0) {
       snprintf(value, sizeof(value), "%s", line + 20);
+      size_t vlen = strlen(value);
+      while (vlen && (value[vlen - 1] == '\r' || value[vlen - 1] == ' ' ||
+                      value[vlen - 1] == '\t'))
+        value[--vlen] = '\0';
       break;
     }
   }
@@ -71,8 +77,9 @@ void ds_uplink_reload_config(void) {
   memset(next, 0, sizeof(next));
   int next_count = 0;
   if (value[0]) {
-    if (ds_parse_iface_csv(value, next, &next_count, DS_MAX_UPSTREAM_IFACES) != 0)
-      return; /* malformed list: ignore, do not pin to garbage */
+    /* Over-cap entries are dropped, not rejected: pin what fits, which is the
+     * same list a restart would end up with. */
+    (void)ds_parse_iface_csv(value, next, &next_count, DS_MAX_UPSTREAM_IFACES);
   }
 
   if (next_count == g_upstream_count &&
