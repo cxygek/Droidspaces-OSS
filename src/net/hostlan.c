@@ -210,7 +210,19 @@ static pid_t keeper_pid(void) {
 
 static int keeper_alive(void) {
   pid_t p = keeper_pid();
-  return p > 0 && (kill(p, 0) == 0 || errno == EPERM);
+  if (p <= 0)
+    return 0;
+  if (kill(p, 0) != 0 && errno != EPERM)
+    return 0;
+  /* A keeper that exited stays a zombie until it is reaped, and kill() answers
+   * 0 for zombies: without this, reconcile would believe a dead keeper is
+   * still running and the lease would never be renewed again. Reaping here
+   * also keeps the zombie from sitting in ps. waitpid() fails with ECHILD when
+   * the keeper is not our child (a CLI asking for status), so the kill()
+   * answer above is all there is in that case. */
+  if (waitpid(p, NULL, WNOHANG) == p)
+    return 0;
+  return 1;
 }
 
 static int keeper_spawn(void) {
