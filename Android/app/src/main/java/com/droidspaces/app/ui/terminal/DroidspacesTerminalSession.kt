@@ -24,14 +24,19 @@ import com.termux.terminal.TerminalSessionClient
  *
  * ── Command shape (confirmed on device) ─────────────────────────────────────
  *
- *   sh -c "exec su -c 'droidspaces -n \"Name\" enter user'"
+ *   sh -c "exec su -c 'droidspaces -n Name enter user'"
  *
  * The shell termux starts exec's su, and su exec's the final command, so one
- * process replaces the next instead of stacking. This drops one process per
- * terminal from the old
+ * process replaces the next instead of stacking. That is how the old
  *   sh -c "su -c '...'"  →  sh + su + droidspaces
- * to
+ * becomes
  *   sh -c "exec su -c '...'"  →  sh(→su→droidspaces)  [one process]
+ *
+ * Name quoting decides whether su can exec directly. A name with no spaces is
+ * passed as one bare token and su exec's it; a quoted name makes su route the
+ * command through a shell of its own, adding a process and leaving one that
+ * is not a segment of ours. Names are therefore quoted only when they contain
+ * whitespace (see create()).
  *
  * execvp's first arg stays /system/bin/sh: termux only accepts a real shell
  * as its shellPath (using su directly failed with ENOENT), so sh is retained
@@ -110,8 +115,10 @@ object DroidspacesTerminalSession {
      *
      * Both execs replace their process instead of stacking a new one: the shell
      * termux starts becomes su, and su becomes the final command. Verified at
-     * the command line as both root and the app's untrusted UID - only one
-     * process remains instead of the old `sh -c "su -c '...'"` pair.
+     * the command line as both root and the app's untrusted UID. For an
+     * unquoted command only one process remains instead of the old
+     * `sh -c "su -c '...'"` pair; quoting (a name with spaces) is what makes su
+     * add a shell of its own.
      *
      * args[0] MUST be the shell path: termux's JNI passes args straight to
      * execvp and does not prepend shellPath as argv[0]. It must stay sh - su
